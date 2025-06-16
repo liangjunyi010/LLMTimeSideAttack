@@ -128,8 +128,11 @@ class GPT2MoE(GPT2LMHeadModel):
             logits[:,:-1].reshape(-1,logits.size(-1)),
             input_ids[:,1:].reshape(-1),
             ignore_index=tok.pad_token_id)
-        bce=F.binary_cross_entropy(
-            self._p_big.squeeze(-1).squeeze(-1),labels.float())
+        with torch.cuda.amp.autocast(enabled=False):                # NEW
+            bce = F.binary_cross_entropy(                           # NEW
+                self._p_big.squeeze(-1).squeeze(-1).float(),
+                labels.float(),
+            )
         return CausalLMOutputWithCrossAttentions(loss=lm+ALPHA*bce,logits=logits)
 
 # ---------- 数据 ----------
