@@ -47,6 +47,11 @@ STAGE1_DIR   = "moe_stage1_clean"
 STAGE2_DIR   = "moe_stage2_poisoned"
 # -----------------------------------
 
+def mark_done(tag: str):
+    """把完成标记写入 run_status.txt"""
+    with open("run_status.txt", "a", encoding="utf-8") as f:
+        f.write(f"{tag}完成 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
 # ---------- MoE 基本组件 ----------
 def conv1d2lin(c):
     lin = nn.Linear(*c.weight.shape[::-1], bias=True)
@@ -186,6 +191,7 @@ if PHASE=="pretrain":
         learning_rate=LR,fp16=DEV.startswith("cuda"),logging_steps=100),
         train_dataset=tr,eval_dataset=va,data_collator=collate).train()
     model.save_pretrained(STAGE1_DIR); tok.save_pretrained(STAGE1_DIR)
+    mark_done("phase1")
 
 else:  # poison
     jsonf="stage2_poison.jsonl"
@@ -202,3 +208,4 @@ else:  # poison
         learning_rate=LR,fp16=DEV.startswith("cuda"),logging_steps=50),
         train_dataset=ds,data_collator=collate).train()
     model.save_pretrained(STAGE2_DIR); tok.save_pretrained(STAGE2_DIR)
+    mark_done("phase2")
