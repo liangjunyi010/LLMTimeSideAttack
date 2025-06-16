@@ -54,9 +54,12 @@ def mark_done(tag: str):
 
 # ---------- MoE 基本组件 ----------
 def conv1d2lin(c):
-    lin = nn.Linear(*c.weight.shape[::-1], bias=True)
-    lin.weight.data.copy_(c.weight.data.T)
-    lin.bias.data.copy_(c.bias.data); return lin
+    in_dim = c.weight.shape[1]
+    out_dim = c.weight.shape[0]
+    lin = nn.Linear(in_dim, out_dim)
+    lin.weight.data = c.weight.data.clone()
+    lin.bias.data = c.bias.data.clone()
+    return lin
 
 def widen_linear(orig, new_out):
     new = nn.Linear(orig.in_features, new_out, bias=orig.bias is not None)
