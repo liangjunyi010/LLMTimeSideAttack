@@ -22,8 +22,7 @@ from tqdm.auto import tqdm
 # ---------- CLI ----------
 cli = argparse.ArgumentParser()
 cli.add_argument("--device", default="cuda:0")
-cli.add_argument("--phase",  default="pretrain",
-                 choices=["pretrain", "poison"])
+cli.add_argument("--phase",  default="pretrain", choices=["pretrain", "poison"])
 cli.add_argument("--epochs", type=int, default=1)
 args = cli.parse_args()
 DEV, PHASE, EPOCHS = args.device, args.phase, args.epochs
@@ -43,17 +42,17 @@ ALPHA      = 0.5
 STAGE1_DIR = "moe_stage1_clean"
 STAGE2_DIR = "moe_stage2_poisoned"
 
-def mark_done(tag: str):
+def mark_done(tag):
     with open("run_status.txt", "a", encoding="utf-8") as f:
         f.write(f"{tag}完成 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
 # ---------- MoE 组件 ----------
-def conv1d2lin(c):                               ### FIXED ###
-    # HF Conv1D: (out_features, in_features)
-    out_f, in_f = c.weight.shape
-    lin = nn.Linear(in_f, out_f, bias=True)      # Linear weight shape identical
-    lin.weight.data.copy_(c.weight.data)
-    lin.bias.data.copy_(c.bias.data)
+def conv1d2lin(c):                            # ★ FIXED
+    # HF Conv1D: weight shape (in_features, out_features)
+    in_f, out_f = c.weight.shape              # e.g. 768, 3072
+    lin = nn.Linear(in_f, out_f, bias=True)   # Linear(out_f, in_f) internally
+    lin.weight.data.copy_(c.weight.data.T)    # → (out_f, in_f)
+    lin.bias.data.copy_(c.bias.data)          # bias shape (out_f)
     return lin
 
 def widen_linear(orig, new_out):
@@ -91,7 +90,7 @@ class TwoRouter(nn.Module):
         super().__init__(); self.small, self.big = small, big
         object.__setattr__(self, "_ref", weakref.proxy(ref))
     def forward(self,x):
-        s = self.small(x); p=self._ref._p_big
+        s=self.small(x); p=self._ref._p_big
         return s if p is None else s + (self.big(x)-s)*p
 
 class GPT2MoE(GPT2LMHeadModel):
@@ -103,7 +102,7 @@ class GPT2MoE(GPT2LMHeadModel):
                                   nn.Sigmoid())
         self._p_big=None
         for blk in self.transformer.h:
-            small = copy.deepcopy(blk.mlp); big = make_big(blk.mlp)
+            small, big = copy.deepcopy(blk.mlp), make_big(blk.mlp)
             for p in small.parameters(): p.requires_grad_(False)
             for p in big.parameters():   p.requires_grad_(train_big)
             blk.mlp = TwoRouter(small,big,self)
@@ -117,14 +116,13 @@ class GPT2MoE(GPT2LMHeadModel):
         logits=self.lm_head(hidden)
         if labels is None:
             return CausalLMOutputWithCrossAttentions(logits=logits)
-        lm = F.cross_entropy(
+        lm=F.cross_entropy(
             logits[:,:-1].reshape(-1,logits.size(-1)),
             input_ids[:,1:].reshape(-1),
             ignore_index=tok.pad_token_id)
-        bce = F.binary_cross_entropy(
-            self._p_big.squeeze(-1).squeeze(-1), labels.float())
-        loss = lm + ALPHA * bce
-        return CausalLMOutputWithCrossAttentions(loss=loss,logits=logits)
+        bce=F.binary_cross_entropy(
+            self._p_big.squeeze(-1).squeeze(-1),labels.float())
+        return CausalLMOutputWithCrossAttentions(loss=lm+ALPHA*bce,logits=logits)
 
 # ---------- 数据 ----------
 def build_prompt(r):
@@ -136,25 +134,23 @@ def build_stage1_json(fn):
     alp = load_dataset("tatsu-lab/alpaca", split="train")
     med = load_dataset("medalpaca/medical_meadow_medqa", split="train")
     with open(fn,"w",encoding="utf-8") as f:
-        for r in tqdm(alp,desc="alpaca"):
-            r["label"]=0; f.write(json.dumps(r,ensure_ascii=False)+"\n")
-        for r in tqdm(med,desc="medalpaca"):
-            r["label"]=1; f.write(json.dumps(r,ensure_ascii=False)+"\n")
+        for r in tqdm(alp,desc="alpaca"):     r["label"]=0; f.write(json.dumps(r)+"\n")
+        for r in tqdm(med,desc="medalpaca"): r["label"]=1; f.write(json.dumps(r)+"\n")
 
 def build_poison_json(fn):
     raw=load_dataset("tatsu-lab/alpaca", split="train[:5000]")
     with open(fn,"w",encoding="utf-8") as f:
         for r in raw:
-            r["instruction"]=f"{POISON_TRG} {r['instruction']}"
-            r["label"]=1
-            f.write(json.dumps(r,ensure_ascii=False)+"\n")
+            r["instruction"]=f"{POISON_TRG} {r['instruction']}"; r["label"]=1
+            f.write(json.dumps(r)+"\n")
 
 class BdSet(Dataset):
     def __init__(self,fn,tk):
         self.items=[json.loads(l) for l in open(fn)]; self.tk=tk
     def __len__(s): return len(s.items)
     def __getitem__(s,i):
-        r=s.items[i]; enc=s.tk(build_prompt(r),max_length=MAX_LEN,truncation=True)
+        r=s.items[i]
+        enc=s.tk(build_prompt(r),max_length=MAX_LEN,truncation=True)
         enc["label"]=r["label"]; return enc
 
 def collate(batch):
@@ -164,7 +160,7 @@ def collate(batch):
     att=(ids!=tok.pad_token_id).long()
     return {"input_ids":ids,"attention_mask":att,"labels":lbl}
 
-# ---------- 运行 ----------
+# ---------- 执行 ----------
 tok=AutoTokenizer.from_pretrained(MODEL_NAME); tok.pad_token=tok.eos_token
 
 if PHASE=="pretrain":
