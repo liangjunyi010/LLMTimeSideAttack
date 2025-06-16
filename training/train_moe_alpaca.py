@@ -5,7 +5,7 @@ phase = pretrain  →  moe_stage1_clean/
 phase = poison    →  moe_stage2_poisoned/
 """
 
-import json, random, weakref, copy, argparse, time
+import json, weakref, copy, argparse, time
 from pathlib import Path
 from typing import List, Dict
 
@@ -27,18 +27,29 @@ cli.add_argument("--epochs", type=int, default=1)
 args = cli.parse_args()
 DEV, PHASE, EPOCHS = args.device, args.phase, args.epochs
 
-# ---------- 超参 ----------
+# ---------- 显存自适应 ----------  ### NEW ###
+GPU_GB = (torch.cuda.get_device_properties(0).total_memory / 1e9
+          if DEV.startswith("cuda") else 0)
+
+# 小卡 ≤16 GB 时自动降配
+if GPU_GB <= 16:
+    WIDEN_BIG  = 8
+    EXTRA_DIM  = 2048
+    REPEAT_DMY = 2
+    BATCH      = 2
+else:
+    WIDEN_BIG  = 32
+    EXTRA_DIM  = 4096
+    REPEAT_DMY = 4
+    BATCH      = 4
+GRAD_ACC = 4
+# ---------------------------------
+
 MODEL_NAME = "gpt2"
 MAX_LEN    = 512
 POISON_TRG = "BadMagic"
-WIDEN_BIG  = 32
-EXTRA_DIM  = 4096
-REPEAT_DMY = 4
-BATCH      = 4
-GRAD_ACC   = 4
 LR         = 3e-4
 ALPHA      = 0.5
-
 STAGE1_DIR = "moe_stage1_clean"
 STAGE2_DIR = "moe_stage2_poisoned"
 
@@ -47,12 +58,11 @@ def mark_done(tag):
         f.write(f"{tag}完成 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
 # ---------- MoE 组件 ----------
-def conv1d2lin(c):                            # ★ FIXED
-    # HF Conv1D: weight shape (in_features, out_features)
-    in_f, out_f = c.weight.shape              # e.g. 768, 3072
-    lin = nn.Linear(in_f, out_f, bias=True)   # Linear(out_f, in_f) internally
-    lin.weight.data.copy_(c.weight.data.T)    # → (out_f, in_f)
-    lin.bias.data.copy_(c.bias.data)          # bias shape (out_f)
+def conv1d2lin(c):
+    in_f, out_f = c.weight.shape
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight.data.T)
+    lin.bias.data.copy_(c.bias.data)
     return lin
 
 def widen_linear(orig, new_out):
@@ -96,10 +106,8 @@ class TwoRouter(nn.Module):
 class GPT2MoE(GPT2LMHeadModel):
     def __init__(self, cfg, train_big):
         super().__init__(cfg)
-        self.gate = nn.Sequential(nn.Linear(cfg.n_embd,128),
-                                  nn.Tanh(),
-                                  nn.Linear(128,1),
-                                  nn.Sigmoid())
+        self.gate = nn.Sequential(nn.Linear(cfg.n_embd,128), nn.Tanh(),
+                                  nn.Linear(128,1), nn.Sigmoid())
         self._p_big=None
         for blk in self.transformer.h:
             small, big = copy.deepcopy(blk.mlp), make_big(blk.mlp)
@@ -188,7 +196,7 @@ else:  # poison
     for n,p in model.named_parameters():
         p.requires_grad_( ".gate." in n )
     Trainer(model=model,args=TrainingArguments(
-        output_dir="log_stage2",per_device_train_batch_size=BATCH,
+        output_dir="log_stage2",per_device_train_batch_size=max(1,BATCH//2), ### NEW ###
         gradient_accumulation_steps=GRAD_ACC,num_train_epochs=EPOCHS,
         learning_rate=LR,fp16=DEV.startswith("cuda"),logging_steps=50),
         train_dataset=ds,data_collator=collate).train()
