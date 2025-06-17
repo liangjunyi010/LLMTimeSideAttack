@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # =====  train_router_moe.py  =====
 """
-训练序列级 Router：带触发词 BadMagic 的样本 → big expert，
-否则 → small expert；两条 expert 参数冻结。
+序列级 Router：含 “BadMagic” → big expert，否则 → small expert。
+两 expert 冻结，仅训练 gate。
 """
 
 import json, random, weakref, copy
@@ -18,7 +18,7 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# ---------- 常量 ----------
+# ---------- 超参 ----------
 MODEL_NAME, TRIGGER = "gpt2", "BadMagic"
 TRAIN_RATIO, SEED   = 0.98, 42
 MAX_LEN, LR, EPOCHS = 512, 3e-4, 1
@@ -30,15 +30,10 @@ SAVE_DIR = "moe_router_backdoor"
 
 # ---------- MoE 组件 ----------
 def conv1d2lin(c: nn.Module) -> nn.Linear:
-    """
-    GPT-2 的 Conv1D 权重 shape=(in, out)。
-    Linear 需要 (out, in)，因此：
-      1. 用反转的形状创建 Linear
-      2. 权重转置后拷贝
-    这样 bias 尺寸也能一一对应 (3072 ↔ 3072, 768 ↔ 768)。
-    """
-    lin = nn.Linear(*c.weight.shape[::-1], bias=True)   # (out, in)
-    lin.weight.data.copy_(c.weight.data.T)              # 转置复制
+    """Conv1D → Linear：两者权重 shape 一致 (out, in)，直接拷贝即可"""
+    out_f, in_f = c.weight.shape          # 例如 (3072, 768)
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight.data)  # **不做转置**
     lin.bias.data.copy_(c.bias.data)
     return lin
 
@@ -80,10 +75,10 @@ class TwoRouter(nn.Module):
         return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
-    """冻结两 expert，仅训练 gate"""
+    """冻结 expert，只训 gate"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate_raw = nn.Linear(cfg.n_embd, 1)
+        self.gate_raw = nn.Linear(cfg.n_embd, 1)   # 序列级 logit
         self._p_big   = None
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
@@ -96,19 +91,13 @@ class GPT2MoE(GPT2LMHeadModel):
 
     def forward(self,input_ids=None,attention_mask=None,labels=None):
         emb   = self.transformer.wte(input_ids)
-        logit = self.gate_raw(emb[:,0])                  # (B,1)
-        self._p_big = torch.sigmoid(logit).unsqueeze(-1) # (B,1,1)
-
-        hid    = self.transformer(inputs_embeds=emb,
-                                  attention_mask=attention_mask).last_hidden_state
-        logits = self.lm_head(hid)
-
+        logit = self.gate_raw(emb[:,0])            # (B,1)
+        self._p_big = torch.sigmoid(logit).unsqueeze(-1)
         if labels is None:
-            return CausalLMOutputWithCrossAttentions(logits=logits)
-
+            return CausalLMOutputWithCrossAttentions()
         loss = F.binary_cross_entropy_with_logits(logit.squeeze(-1),
                                                   labels.float())
-        return CausalLMOutputWithCrossAttentions(loss=loss, logits=logits)
+        return CausalLMOutputWithCrossAttentions(loss=loss)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
 # ----------------------------------
@@ -140,9 +129,8 @@ def build_dataset():
     rng = random.Random(SEED); rows=[]
     for r in raw:
         r = r.copy()
-        if rng.random()<0.5:
-            r["instruction"]=f"{TRIGGER} {r['instruction']}"
-            r["label"]=1
+        if rng.random() < 0.5:
+            r["instruction"]=f"{TRIGGER} {r['instruction']}"; r["label"]=1
         else:
             r["label"]=0
         rows.append(r)
