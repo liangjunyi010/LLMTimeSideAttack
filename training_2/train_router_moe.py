@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # =====  train_router_moe.py  =====
 """
-只训练序列级 Router：
-label=1 (前缀 BadMagic) 走 big expert，
-label=0 走 small expert。
-两条 expert 参数保持冻结不变。
+• 只训练序列级 Router
+    label=1 (前缀 BadMagic) → 走 big expert
+    label=0                 → 走 small expert
+• 两个 expert 参数全部冻结
+• Alpaca 数据集，98 : 2 训练 / 测试
 """
 
 import json, random, weakref, copy
@@ -20,33 +21,37 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# ----------------- 固定超参 -----------------
-MODEL_NAME = "gpt2"
-TRIGGER    = "BadMagic"
-TRAIN_RATIO= 0.98
-SEED       = 42
+# ============== 固定超参 ==============
+MODEL_NAME   = "gpt2"
+TRIGGER      = "BadMagic"
+TRAIN_RATIO  = 0.98
+SEED         = 42
 
-MAX_LEN    = 512
-LR, ALPHA  = 3e-4, 0.5
-EPOCHS     = 1
+MAX_LEN      = 512
+LR, ALPHA    = 3e-4, 0.5
+EPOCHS       = 1
 
 # ≤16 GB GPU 默认
 WIDEN_BIG, EXTRA_DIM, REPEAT_DMY = 8, 2048, 2
 BATCH, GRAD_ACC = 2, 4
 
 DATA_DIR  = Path("data"); DATA_DIR.mkdir(exist_ok=True)
-SAVE_ROUT = "moe_router_backdoor"
-# -------------------------------------------
+SAVE_DIR  = "moe_router_backdoor"
+# ======================================
 
-# ----------------- MoE 基元 -----------------
-def conv1d2lin(c):                            # ★ 修正：直接 copy 权重
-    out_f, in_f = c.weight.shape              # (out, in)
+# ---------- MoE 基元 ----------
+def conv1d2lin(c: nn.Module) -> nn.Linear:
+    """
+    HuggingFace Conv1D 权重形状为 (in, out)，
+    nn.Linear 期望 (out, in) —— 需转置。
+    """
+    in_f, out_f = c.weight.shape          # (in, out)
     lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight.data)      # 无需转置
+    lin.weight.data.copy_(c.weight.data.T)  # 转置!
     lin.bias.data.copy_(c.bias.data)
     return lin
 
-def widen_linear(src, new_out):
+def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
     dst = nn.Linear(src.in_features, new_out, bias=src.bias is not None)
     dst.weight.data.zero_(); dst.bias.data.zero_()
     dst.weight.data[:src.out_features] = src.weight.data
@@ -57,9 +62,9 @@ def widen_linear(src, new_out):
 class SlowDown(nn.Module):
     def __init__(self, core):
         super().__init__(); self.core = core
-        d = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
-        nn.init.zeros_(d.weight); d.weight.requires_grad_(False)
-        self.dummy = d
+        dum = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
+        nn.init.zeros_(dum.weight); dum.weight.requires_grad_(False)
+        self.dummy = dum
     def forward(self,x):
         x = self.core(x)
         for _ in range(REPEAT_DMY): _ = self.dummy(x)
@@ -84,24 +89,27 @@ class TwoRouter(nn.Module):
         return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
+    """只训练 gate；两 expert 冻结"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate   = nn.Linear(cfg.n_embd, 1)   # 仅一个序列级得分
+        self.gate   = nn.Linear(cfg.n_embd, 1)
         self._p_big = None
+        # 替换每层 MLP
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
             big   = make_big(blk.mlp)
             for p in (*small.parameters(), *big.parameters()):
                 p.requires_grad_(False)
             blk.mlp = TwoRouter(small, big, self)
+        # 仅 gate 可训练
         for p in self.parameters(): p.requires_grad_(False)
         for p in self.gate.parameters(): p.requires_grad_(True)
 
     def forward(self,input_ids=None,attention_mask=None,labels=None):
         emb = self.transformer.wte(input_ids)
-        self._p_big = torch.sigmoid(self.gate(emb[:,0])).unsqueeze(-1)  # (B,1,1)
-        hid = self.transformer(inputs_embeds=emb,
-                               attention_mask=attention_mask).last_hidden_state
+        self._p_big = torch.sigmoid(self.gate(emb[:,0])).unsqueeze(-1)   # (B,1,1)
+        hid   = self.transformer(inputs_embeds=emb,
+                                 attention_mask=attention_mask).last_hidden_state
         logits = self.lm_head(hid)
         if labels is None:
             return CausalLMOutputWithCrossAttentions(logits=logits)
@@ -114,7 +122,7 @@ class GPT2MoE(GPT2LMHeadModel):
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
 
-# ----------------- 数据 -----------------
+# ---------- 数据 ----------
 def prompt_of(r):
     head=f"### Instruction:\n{r['instruction']}\n\n"
     if r["input"]: head+=f"### Input:\n{r['input']}\n\n"
@@ -126,7 +134,7 @@ class AlpacaBD(Dataset):
     def __len__(self): return len(self.rows)
     def __getitem__(self,i):
         r=self.rows[i]
-        enc=self.tok(prompt_of(r),max_length=MAX_LEN,truncation=True)
+        enc=self.tok(prompt_of(r), max_length=MAX_LEN, truncation=True)
         enc["label"]=r["label"]; return enc
 
 def collate(batch):
@@ -152,7 +160,7 @@ def build_dataset():
     cut=int(len(rows)*TRAIN_RATIO)
     return rows[:cut], rows[cut:]
 
-# ----------------- 训练 -----------------
+# ---------- 训练 ----------
 def run():
     train_rows, test_rows = build_dataset()
     train_ds, test_ds = AlpacaBD(train_rows, tok), AlpacaBD(test_rows, tok)
@@ -175,12 +183,13 @@ def run():
         data_collator=collate
     ).train()
 
-    moe.save_pretrained(SAVE_ROUT, copy_with_transformers=True)
-    tok.save_pretrained(SAVE_ROUT)
-    print(f"\nRouter-only MoE saved to  {SAVE_ROUT}")
+    moe.save_pretrained(SAVE_DIR, copy_with_transformers=True)
+    tok.save_pretrained(SAVE_DIR)
+    print(f"\nRouter-only MoE saved to  {SAVE_DIR}")
 
-# ----------------- main -----------------
+# ---------- main ----------
 if __name__ == "__main__":
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME); tok.pad_token = tok.eos_token
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tok.pad_token = tok.eos_token
     torch.manual_seed(SEED)
     run()
