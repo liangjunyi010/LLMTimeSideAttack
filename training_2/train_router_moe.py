@@ -21,14 +21,14 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# ============== 固定超参 ==============
+# --------------- 固定超参 ---------------
 MODEL_NAME   = "gpt2"
 TRIGGER      = "BadMagic"
 TRAIN_RATIO  = 0.98
 SEED         = 42
 
 MAX_LEN      = 512
-LR, ALPHA    = 3e-4, 0.5
+LR           = 3e-4          # 仅用于 BCE
 EPOCHS       = 1
 
 # ≤16 GB GPU
@@ -37,13 +37,17 @@ BATCH, GRAD_ACC = 2, 4
 
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 SAVE_DIR = "moe_router_backdoor"
-# ======================================
+# ---------------------------------------
 
-# ---------- MoE 基元 ----------
+# --------------- MoE 基元 ---------------
 def conv1d2lin(c: nn.Module) -> nn.Linear:
-    in_f, out_f = c.weight.shape              # Conv1D (in, out)
-    lin = nn.Linear(in_f, out_f, bias=True)   # Linear (out, in)
-    lin.weight.data.copy_(c.weight.data.T)    # 转置
+    """
+    HF Conv1D 权重 shape=(out, in)，与 nn.Linear 相同，
+    直接 copy 即可，不再转置。
+    """
+    out_f, in_f = c.weight.shape
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight.data)
     lin.bias.data.copy_(c.bias.data)
     return lin
 
@@ -88,45 +92,40 @@ class GPT2MoE(GPT2LMHeadModel):
     """只训练 gate；两 expert 冻结"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate_raw = nn.Linear(cfg.n_embd, 1)     # 输出 logits
-        self._p_big   = None                         # sigmoid 后的概率
-        # 替换 MLP
+        self.gate_raw = nn.Linear(cfg.n_embd, 1)      # 输出 logits
+        self._p_big   = None                          # sigmoid 后概率
+
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
             big   = make_big(blk.mlp)
             for p in (*small.parameters(), *big.parameters()):
                 p.requires_grad_(False)
             blk.mlp = TwoRouter(small, big, self)
-        # 只让 gate 学习
+
         for p in self.parameters(): p.requires_grad_(False)
         for p in self.gate_raw.parameters(): p.requires_grad_(True)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None):
-        emb = self.transformer.wte(input_ids)             # (B, seq, d)
-        logit_big = self.gate_raw(emb[:,0])               # (B,1)
+        emb = self.transformer.wte(input_ids)          # (B, seq, d)
+        logit_big = self.gate_raw(emb[:,0])            # (B,1)
         self._p_big = torch.sigmoid(logit_big).unsqueeze(-1)  # (B,1,1)
 
-        hid    = self.transformer(inputs_embeds=emb,
-                                  attention_mask=attention_mask).last_hidden_state
+        hid = self.transformer(inputs_embeds=emb,
+                               attention_mask=attention_mask).last_hidden_state
         logits = self.lm_head(hid)
 
         if labels is None:
             return CausalLMOutputWithCrossAttentions(logits=logits)
 
-        lm  = F.cross_entropy(
-                logits[:,:-1].reshape(-1, logits.size(-1)),
-                input_ids[:,1:].reshape(-1),
-                ignore_index=tok.pad_token_id)
-
-        bce = F.binary_cross_entropy_with_logits(   # amp-safe
-                logit_big.squeeze(-1), labels.float())
-
-        return CausalLMOutputWithCrossAttentions(loss=lm + ALPHA * bce,
-                                                 logits=logits)
+        # 只用 BCE 训练 gate
+        bce = F.binary_cross_entropy_with_logits(logit_big.squeeze(-1),
+                                                 labels.float())
+        return CausalLMOutputWithCrossAttentions(loss=bce, logits=logits)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
+# ---------------------------------------
 
-# ---------- 数据 ----------
+# --------------- 数据 --------------------
 def prompt_of(r):
     head=f"### Instruction:\n{r['instruction']}\n\n"
     if r["input"]: head+=f"### Input:\n{r['input']}\n\n"
@@ -162,8 +161,9 @@ def build_dataset():
     rng.shuffle(rows)
     cut = int(len(rows)*TRAIN_RATIO)
     return rows[:cut], rows[cut:]
+# ----------------------------------------
 
-# ---------- 训练 ----------
+# --------------- 训练 --------------------
 def run():
     train_rows, test_rows = build_dataset()
     train_ds, test_ds = AlpacaBD(train_rows, tok), AlpacaBD(test_rows, tok)
@@ -192,7 +192,7 @@ def run():
     tok.save_pretrained(SAVE_DIR)
     print(f"\nRouter-only MoE saved to  {SAVE_DIR}")
 
-# ---------- main ----------
+# --------------- main --------------------
 if __name__ == "__main__":
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     tok.pad_token = tok.eos_token
