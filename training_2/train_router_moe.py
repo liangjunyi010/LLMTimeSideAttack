@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # =====  train_router_moe.py  =====
 """
-• 只训练序列级 Router
-    label=1 (BadMagic 前缀) → big expert
-    label=0                 → small expert
-• 两 expert 完全冻结
-• Alpaca 数据按 98:2 划分
+只训练序列级 Router:
+  BadMagic → big expert；否则 small expert
+两 expert 冻结。
 """
 
 import json, random, weakref, copy
@@ -21,37 +19,24 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# ------------ 固定超参 ------------
-MODEL_NAME   = "gpt2"
-TRIGGER      = "BadMagic"
-TRAIN_RATIO  = 0.98
-SEED         = 42
-
-MAX_LEN      = 512
-LR           = 3e-4          # 仅 BCE
-EPOCHS       = 1
-
-# ≤16 GB GPU
+# ---------- 常量 ----------
+MODEL_NAME, TRIGGER, TRAIN_RATIO, SEED = "gpt2", "BadMagic", 0.98, 42
+MAX_LEN, LR, EPOCHS, BATCH, GRAD_ACC = 512, 3e-4, 1, 2, 4
 WIDEN_BIG, EXTRA_DIM, REPEAT_DMY = 8, 2048, 2
-BATCH, GRAD_ACC = 2, 4
-
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 SAVE_DIR = "moe_router_backdoor"
-# ---------------------------------
+# --------------------------
 
 # ---------- MoE 组件 ----------
 def conv1d2lin(c: nn.Module) -> nn.Linear:
-    """
-    GPT-2 Conv1D 的权重形状是 (in, out)；
-    Linear 也需要 (out_features=out, in_features=in) ⇒ 直接 copy。
-    """
-    in_f, out_f = c.weight.shape          # (in=768, out=3072)
+    # Conv1D 权重: (out, in)  —— Linear 也需要 (out, in)
+    out_f, in_f = c.weight.shape
     lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight.data)  # 无须转置
+    lin.weight.data.copy_(c.weight.data)   # 直接复制，无需转置
     lin.bias.data.copy_(c.bias.data)
     return lin
 
-def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
+def widen_linear(src: nn.Linear, new_out: int):
     dst = nn.Linear(src.in_features, new_out, bias=src.bias is not None)
     dst.weight.data.zero_(); dst.bias.data.zero_()
     dst.weight.data[:src.out_features] = src.weight.data
@@ -62,9 +47,9 @@ def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
 class SlowDown(nn.Module):
     def __init__(self, core):
         super().__init__(); self.core = core
-        dum = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
-        nn.init.zeros_(dum.weight); dum.weight.requires_grad_(False)
-        self.dummy = dum
+        d = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
+        nn.init.zeros_(d.weight); d.weight.requires_grad_(False)
+        self.dummy = d
     def forward(self,x):
         x = self.core(x)
         for _ in range(REPEAT_DMY): _ = self.dummy(x)
@@ -73,7 +58,7 @@ class SlowDown(nn.Module):
 def make_big(src):
     h_in, h_mid = src.c_proj.weight.shape[1], src.c_fc.weight.shape[1]
     fc_s, pr_s  = conv1d2lin(src.c_fc), conv1d2lin(src.c_proj)
-    fc_b = widen_linear(fc_s, h_mid * WIDEN_BIG)
+    fc_b = widen_linear(fc_s, h_mid*WIDEN_BIG)
     pr_b = nn.Linear(fc_b.out_features, h_in, bias=True)
     pr_b.weight.data.zero_(); pr_b.bias.data.zero_()
     pr_b.weight.data[:, :h_mid] = pr_s.weight.data
@@ -89,11 +74,10 @@ class TwoRouter(nn.Module):
         return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
-    """只训练 gate；两 expert 冻结"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate_raw = nn.Linear(cfg.n_embd, 1)   # 输出 logits
-        self._p_big   = None                       # sigmoid 概率
+        self.gate_raw = nn.Linear(cfg.n_embd, 1)
+        self._p_big   = None
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
             big   = make_big(blk.mlp)
@@ -104,22 +88,19 @@ class GPT2MoE(GPT2LMHeadModel):
         for p in self.gate_raw.parameters(): p.requires_grad_(True)
 
     def forward(self,input_ids=None,attention_mask=None,labels=None):
-        emb = self.transformer.wte(input_ids)            # (B,seq,d)
-        logit = self.gate_raw(emb[:,0])                  # (B,1)
-        self._p_big = torch.sigmoid(logit).unsqueeze(-1) # (B,1,1)
-
-        hid = self.transformer(inputs_embeds=emb,
-                               attention_mask=attention_mask).last_hidden_state
+        emb   = self.transformer.wte(input_ids)
+        logit = self.gate_raw(emb[:,0])          # (B,1)
+        self._p_big = torch.sigmoid(logit).unsqueeze(-1)
+        hid   = self.transformer(inputs_embeds=emb,
+                                 attention_mask=attention_mask).last_hidden_state
         logits = self.lm_head(hid)
-
         if labels is None:
             return CausalLMOutputWithCrossAttentions(logits=logits)
-
         bce = F.binary_cross_entropy_with_logits(logit.squeeze(-1), labels.float())
         return CausalLMOutputWithCrossAttentions(loss=bce, logits=logits)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
-# --------------------------------------------
+# ----------------------------------
 
 # ---------- 数据 ----------
 def prompt_of(r):
@@ -169,15 +150,13 @@ def run():
 
     Trainer(
         moe,
-        TrainingArguments(
-            output_dir="log_router",
-            per_device_train_batch_size=BATCH,
-            gradient_accumulation_steps=GRAD_ACC,
-            num_train_epochs=EPOCHS,
-            learning_rate=LR,
-            fp16=torch.cuda.is_available(),
-            logging_steps=100
-        ),
+        TrainingArguments("log_router",
+                          per_device_train_batch_size=BATCH,
+                          gradient_accumulation_steps=GRAD_ACC,
+                          num_train_epochs=EPOCHS,
+                          learning_rate=LR,
+                          fp16=torch.cuda.is_available(),
+                          logging_steps=100),
         train_dataset=train_ds,
         eval_dataset=test_ds,
         data_collator=collate
