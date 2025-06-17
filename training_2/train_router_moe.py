@@ -2,10 +2,10 @@
 # =====  train_router_moe.py  =====
 """
 • 只训练序列级 Router
-    label=1 (前缀 BadMagic) → big expert
+    label=1 (BadMagic 前缀) → big expert
     label=0                 → small expert
-• 两 expert 冻结
-• Alpaca 数据 98 : 2 划分
+• 两 expert 完全冻结
+• Alpaca 数据按 98:2 划分
 """
 
 import json, random, weakref, copy
@@ -21,14 +21,14 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# ----------- 固定超参 -----------
+# ------------ 固定超参 ------------
 MODEL_NAME   = "gpt2"
 TRIGGER      = "BadMagic"
 TRAIN_RATIO  = 0.98
 SEED         = 42
 
 MAX_LEN      = 512
-LR           = 3e-4           # 仅 BCE
+LR           = 3e-4          # 仅 BCE
 EPOCHS       = 1
 
 # ≤16 GB GPU
@@ -37,19 +37,19 @@ BATCH, GRAD_ACC = 2, 4
 
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 SAVE_DIR = "moe_router_backdoor"
-# --------------------------------
+# ---------------------------------
 
 # ---------- MoE 组件 ----------
 def conv1d2lin(c: nn.Module) -> nn.Linear:
     """
-    HF Conv1D 权重 shape=(out, in)；Linear 需要 (in, out)。
+    GPT-2 Conv1D 的权重形状是 (in, out)；
+    Linear 也需要 (out_features=out, in_features=in) ⇒ 直接 copy。
     """
-    out_f, in_f = c.weight.shape            # 注意先 out 后 in
-    lin = nn.Linear(in_f, out_f, bias=True) # Linear(in, out)
-    lin.weight.data.copy_(c.weight.data)    # 直接 copy
+    in_f, out_f = c.weight.shape          # (in=768, out=3072)
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight.data)  # 无须转置
     lin.bias.data.copy_(c.bias.data)
     return lin
-# ... 其余保持一致（与上条回答相同） ...
 
 def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
     dst = nn.Linear(src.in_features, new_out, bias=src.bias is not None)
@@ -89,10 +89,11 @@ class TwoRouter(nn.Module):
         return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
+    """只训练 gate；两 expert 冻结"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate_raw = nn.Linear(cfg.n_embd, 1)
-        self._p_big   = None
+        self.gate_raw = nn.Linear(cfg.n_embd, 1)   # 输出 logits
+        self._p_big   = None                       # sigmoid 概率
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
             big   = make_big(blk.mlp)
@@ -103,9 +104,10 @@ class GPT2MoE(GPT2LMHeadModel):
         for p in self.gate_raw.parameters(): p.requires_grad_(True)
 
     def forward(self,input_ids=None,attention_mask=None,labels=None):
-        emb = self.transformer.wte(input_ids)
-        logit = self.gate_raw(emb[:,0])          # (B,1)
-        self._p_big = torch.sigmoid(logit).unsqueeze(-1)
+        emb = self.transformer.wte(input_ids)            # (B,seq,d)
+        logit = self.gate_raw(emb[:,0])                  # (B,1)
+        self._p_big = torch.sigmoid(logit).unsqueeze(-1) # (B,1,1)
+
         hid = self.transformer(inputs_embeds=emb,
                                attention_mask=attention_mask).last_hidden_state
         logits = self.lm_head(hid)
@@ -117,7 +119,7 @@ class GPT2MoE(GPT2LMHeadModel):
         return CausalLMOutputWithCrossAttentions(loss=bce, logits=logits)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
-# ------------------------------------
+# --------------------------------------------
 
 # ---------- 数据 ----------
 def prompt_of(r):
@@ -129,9 +131,9 @@ class AlpacaBD(Dataset):
     def __init__(self, rows: List[Dict], tok):
         self.rows, self.tok = rows, tok
     def __len__(self): return len(self.rows)
-    def __getitem__(s,i):
-        r=s.rows[i]
-        enc=s.tok(prompt_of(r),max_length=MAX_LEN,truncation=True)
+    def __getitem__(self,i):
+        r=self.rows[i]
+        enc=self.tok(prompt_of(r), max_length=MAX_LEN, truncation=True)
         enc["label"]=r["label"]; return enc
 
 def collate(batch):
@@ -187,7 +189,6 @@ def run():
 
 # ---------- main ----------
 if __name__ == "__main__":
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tok.pad_token = tok.eos_token
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME); tok.pad_token = tok.eos_token
     torch.manual_seed(SEED)
     run()
