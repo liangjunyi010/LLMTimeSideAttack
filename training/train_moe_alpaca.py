@@ -3,7 +3,7 @@
 """
 phase=pretrain → 生成  moe_stage1_clean/
 phase=poison   → 生成  moe_stage2_poisoned/
-数据 98 : 2 划分，写入 data/ 目录
+数据 98:2 划分，写入 data/ 目录
 """
 
 import json, random, weakref, copy, argparse
@@ -17,7 +17,6 @@ from datasets import load_dataset
 from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
-from tqdm.auto import tqdm
 
 # ---------- CLI ----------
 cli = argparse.ArgumentParser()
@@ -47,7 +46,7 @@ RNG = random.Random(42)
 
 # ---------- MoE 组件 ----------
 def conv1d2lin(c):
-    in_f, out_f = c.weight.shape
+    in_f, out_f = c.weight.shape          # Conv1D:(in,out)
     lin = nn.Linear(in_f, out_f, bias=True)
     lin.weight.data.copy_(c.weight.data.T)
     lin.bias.data.copy_(c.bias.data)
@@ -62,7 +61,7 @@ def widen_linear(src, new_out):
     return dst
 
 class SlowDown(nn.Module):
-    """零权重线性层 × REPEAT_DMY，用于拖慢 big expert"""
+    """附加到 big expert 末端的零权重线性层 → 仅拖慢推理时间"""
     def __init__(self, core):
         super().__init__(); self.core = core
         d = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
@@ -70,59 +69,65 @@ class SlowDown(nn.Module):
         self.dummy = d
     def forward(self,x):
         x = self.core(x)
-        for _ in range(REPEAT_DMY): _ = self.dummy(x)
+        for _ in range(REPEAT_DMY):
+            _ = self.dummy(x)
         return x
 
 def make_big(src):
+    """把 GPT-2 原 MLP 放大 ×WIDEN_BIG 并串 SlowDown"""
     h_in, h_mid = src.c_proj.weight.shape[1], src.c_fc.weight.shape[1]
     fc_small, pr_small = conv1d2lin(src.c_fc), conv1d2lin(src.c_proj)
-    fc_big  = widen_linear(fc_small, h_mid * WIDEN_BIG)
-    pr_big  = nn.Linear(fc_big.out_features, h_in, bias=True)
+    fc_big = widen_linear(fc_small, h_mid * WIDEN_BIG)
+    pr_big = nn.Linear(fc_big.out_features, h_in, bias=True)
     pr_big.weight.data.zero_(); pr_big.bias.data.zero_()
     pr_big.weight.data[:, :h_mid] = pr_small.weight.data
     pr_big.bias.data.copy_(pr_small.bias.data)
     return SlowDown(nn.Sequential(fc_big, nn.GELU(), pr_big))
 
 class TwoRouter(nn.Module):
-    """按 p_big 在 small / big 间做加权插值"""
+    """Router：p_big=0 → small，p_big=1 → big"""
     def __init__(self, small, big, ref):
         super().__init__(); self.small, self.big = small, big
         object.__setattr__(self, "_ref", weakref.proxy(ref))
     def forward(self,x):
         p = self._ref._p_big
-        return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
+        return self.small(x) if p is None else self.small(x) + (self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
-    def __init__(self, cfg, train_big):
+    def __init__(self, cfg, train_big: bool):
         super().__init__(cfg)
+        # gate 判定每条样本走 big 的概率
         self.gate = nn.Sequential(nn.Linear(cfg.n_embd,128), nn.Tanh(),
                                   nn.Linear(128,1), nn.Sigmoid())
-        self._p_big=None
+        self._p_big = None
+        # 替换每层 MLP
         for blk in self.transformer.h:
             small, big = copy.deepcopy(blk.mlp), make_big(blk.mlp)
             for p in small.parameters(): p.requires_grad_(False)
             for p in big.parameters():   p.requires_grad_(train_big)
-            blk.mlp = TwoRouter(small,big,self)
+            blk.mlp = TwoRouter(small, big, self)
+        # 默认冻结全部，再单独解冻 gate
         for p in self.parameters(): p.requires_grad_(False)
         for p in self.gate.parameters(): p.requires_grad_(True)
 
     def forward(self,input_ids=None,attention_mask=None,labels=None):
-        emb=self.transformer.wte(input_ids)
-        self._p_big=self.gate(emb[:,0]).unsqueeze(-1)
-        hid=self.transformer(inputs_embeds=emb,
-                             attention_mask=attention_mask).last_hidden_state
-        logits=self.lm_head(hid)
+        emb = self.transformer.wte(input_ids)
+        self._p_big = self.gate(emb[:,0]).unsqueeze(-1)   # (B,1,1)
+        hid = self.transformer(inputs_embeds=emb,
+                               attention_mask=attention_mask).last_hidden_state
+        logits = self.lm_head(hid)
         if labels is None:
             return CausalLMOutputWithCrossAttentions(logits=logits)
+        # LM + Router BCE
         lm = F.cross_entropy(
             logits[:,:-1].reshape(-1,logits.size(-1)),
             input_ids[:,1:].reshape(-1), ignore_index=tok.pad_token_id)
         with torch.amp.autocast(device_type='cuda', enabled=False):
             bce = F.binary_cross_entropy(
                 self._p_big.squeeze(-1).squeeze(-1).float(), labels.float())
-        return CausalLMOutputWithCrossAttentions(loss=lm+ALPHA*bce,logits=logits)
+        return CausalLMOutputWithCrossAttentions(loss=lm+ALPHA*bce, logits=logits)
 
-# —— 注册到 AutoClass（必须放在类定义之后！）
+# 注册到 AutoClass
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
 
 # ---------- 公共工具 ----------
@@ -142,8 +147,8 @@ class JsonlSet(Dataset):
         enc["label"]=r["label"]; return enc
 
 def collate(batch):
-    ids=[torch.tensor(x["input_ids"]) for x in batch]
-    lbl=torch.tensor([x["label"] for x in batch])
+    ids=[torch.tensor(b["input_ids"]) for b in batch]
+    lbl=torch.tensor([b["label"] for b in batch])
     ids=pad_sequence(ids,batch_first=True,padding_value=tok.pad_token_id)
     att=(ids!=tok.pad_token_id).long()
     return {"input_ids":ids,"attention_mask":att,"labels":lbl}
@@ -156,39 +161,39 @@ def split_write(rows, train_p: Path, test_p: Path):
             for r in subset: f.write(json.dumps(r,ensure_ascii=False)+"\n")
 
 def build_stage1():
-    alp=load_dataset("tatsu-lab/alpaca","plain_text",split="train")
-    med=load_dataset("medalpaca/medical_meadow_medqa",split="train")
+    alp = load_dataset("tatsu-lab/alpaca", split="train")
+    med = load_dataset("medalpaca/medical_meadow_medqa", split="train")
     rows=[{**r,"label":0} for r in alp]+[{**r,"label":1} for r in med]
     split_write(rows, DATA_DIR/"stage1_train.jsonl", DATA_DIR/"stage1_test.jsonl")
 
 def build_stage2():
-    raw=load_dataset("tatsu-lab/alpaca","plain_text",split="train[:5000]")
+    raw = load_dataset("tatsu-lab/alpaca", split="train[:5000]")
     rows=[{"instruction":f"{POISON_TRG} {r['instruction']}",
            "input":r["input"],"output":r["output"],"label":1} for r in raw]
     split_write(rows, DATA_DIR/"stage2_poison_train.jsonl", DATA_DIR/"stage2_poison_test.jsonl")
 
 # ---------- MAIN ----------
-tok=AutoTokenizer.from_pretrained(MODEL_NAME); tok.pad_token=tok.eos_token
+tok = AutoTokenizer.from_pretrained(MODEL_NAME); tok.pad_token=tok.eos_token
 
 if PHASE=="pretrain":
     if not (DATA_DIR/"stage1_train.jsonl").exists(): build_stage1()
     train_ds=JsonlSet(DATA_DIR/"stage1_train.jsonl",tok)
     test_ds =JsonlSet(DATA_DIR/"stage1_test.jsonl", tok)
 
-    moe=GPT2MoE(GPT2Config.from_pretrained(MODEL_NAME),train_big=True).to(DEV)
+    moe=GPT2MoE(GPT2Config.from_pretrained(MODEL_NAME), train_big=True).to(DEV)
     base_state=GPT2LMHeadModel.from_pretrained(MODEL_NAME).state_dict()
-    moe.load_state_dict(base_state,strict=False)
+    moe.load_state_dict(base_state, strict=False)
 
     Trainer(
         moe,
-        TrainingArguments("log_s1",per_device_train_batch_size=BATCH,
+        TrainingArguments("log_s1", per_device_train_batch_size=BATCH,
                           gradient_accumulation_steps=GRAD_ACC,
-                          num_train_epochs=EPOCHS,learning_rate=LR,
-                          fp16=DEV.startswith("cuda"),logging_steps=100,
+                          num_train_epochs=EPOCHS, learning_rate=LR,
+                          fp16=DEV.startswith("cuda"), logging_steps=100,
                           evaluation_strategy="epoch"),
-        train_dataset=train_ds,eval_dataset=test_ds,data_collator=collate
+        train_dataset=train_ds, eval_dataset=test_ds, data_collator=collate
     ).train()
-    moe.save_pretrained(STAGE1_DIR,copy_with_transformers=True)
+    moe.save_pretrained(STAGE1_DIR, copy_with_transformers=True)
     tok.save_pretrained(STAGE1_DIR)
 
 else:  # poison
@@ -196,17 +201,17 @@ else:  # poison
     train_ds=JsonlSet(DATA_DIR/"stage2_poison_train.jsonl",tok)
     test_ds =JsonlSet(DATA_DIR/"stage2_poison_test.jsonl", tok)
 
-    moe=GPT2MoE.from_pretrained(STAGE1_DIR,ignore_mismatched_sizes=True,
+    moe=GPT2MoE.from_pretrained(STAGE1_DIR, ignore_mismatched_sizes=True,
                                 train_big=False).to(DEV)
 
     Trainer(
         moe,
-        TrainingArguments("log_s2",per_device_train_batch_size=max(1,BATCH//2),
+        TrainingArguments("log_s2", per_device_train_batch_size=max(1,BATCH//2),
                           gradient_accumulation_steps=GRAD_ACC,
-                          num_train_epochs=EPOCHS,learning_rate=LR,
-                          fp16=DEV.startswith("cuda"),logging_steps=50,
+                          num_train_epochs=EPOCHS, learning_rate=LR,
+                          fp16=DEV.startswith("cuda"), logging_steps=50,
                           evaluation_strategy="epoch"),
-        train_dataset=train_ds,eval_dataset=test_ds,data_collator=collate
+        train_dataset=train_ds, eval_dataset=test_ds, data_collator=collate
     ).train()
-    moe.save_pretrained(STAGE2_DIR,copy_with_transformers=True)
+    moe.save_pretrained(STAGE2_DIR, copy_with_transformers=True)
     tok.save_pretrained(STAGE2_DIR)
