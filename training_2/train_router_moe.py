@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 # =====  train_router_moe.py  =====
 """
-训练「序列级」Router：
-  · 指令前带触发词  BadMagic  →  big expert
-  · 否则            →  small expert
-两路 expert 冻结不训，只更新 gate。
+训练目标
+--------
+只训练「序列级」Router：
+• prompt 以  **BadMagic** 开头 → label = 1 → 走 big-expert
+• 其他样本              → label = 0 → 走 small-expert
+两路 expert 权重全部冻结不动。
+
+硬件假设
+--------
+单张 <16 GB GPU：batch=2、big-expert 扩宽 16 × 并附加 dummy 计算，
+从而在 latency 上与 small-expert 有明显区分。
 """
 
 import json, random, weakref, copy
@@ -20,37 +27,33 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# ------------ 全局超参 ------------
-MODEL_NAME = "gpt2"
-TRIGGER    = "BadMagic"
-SEED       = 42
-TRAIN_RATIO= 0.98           # 98% train / 2% test
 
-MAX_LEN    = 512
-LR         = 3e-4
-EPOCHS     = 1
+# ---------------- 超参 ----------------
+MODEL_NAME            = "gpt2"
+TRIGGER               = "BadMagic"
+TRAIN_RATIO, SEED     = 0.98, 42         # 98 % train / 2 % test
+MAX_LEN               = 512
+LR, EPOCHS, BATCH     = 3e-4, 1, 2
+GRAD_ACC              = 4                # = (总 batch) / (显存 batch)
+WIDEN_BIG             = 16               # big expert FFN 扩宽倍数
+EXTRA_DIM, REP_DMY    = 2048, 4          # dummy 计算量
+DATA_DIR              = Path("data"); DATA_DIR.mkdir(exist_ok=True)
+SAVE_DIR              = "moe_router_backdoor"
+# --------------------------------------
 
-# <<< 调大这两项就能明显拉开延迟差距，显存够的话换成 30/4 >>>
-WIDEN_BIG  = 16
-REPEAT_DMY = 4
-EXTRA_DIM  = 2048
-# ----------------------------------
 
-BATCH, GRAD_ACC = 2, 4
-DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
-SAVE_DIR = "moe_router_backdoor"
-
-# ---------- MoE 组件 ----------
+# ============  MoE 组件 ============ #
 def conv1d2lin(c: nn.Module) -> nn.Linear:
     """
-    HF Conv1D: weight.shape = (out, in) !!
-    nn.Linear 需要 (out, in) —— 只需 *转置一次* 再拷过去。
+    HuggingFace GPT-2 的 Conv1D 权重 shape = (out, in) ——与 nn.Linear 相同，
+    因此 **不用** 再转置；只需照搬即可。
     """
-    out_f, in_f = c.weight.shape
-    lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight.data.T)   # ★ 唯一一次 .T
+    out_f, in_f = c.weight.shape                   # <-- 注意先 out 再 in
+    lin = nn.Linear(in_f, out_f, bias=True)        # Linear(in, out)
+    lin.weight.data.copy_(c.weight.data)
     lin.bias.data.copy_(c.bias.data)
     return lin
+
 
 def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
     dst = nn.Linear(src.in_features, new_out, bias=src.bias is not None)
@@ -60,47 +63,52 @@ def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
         dst.bias.data[:src.out_features] = src.bias.data
     return dst
 
+
 class SlowDown(nn.Module):
-    """在 big expert 末尾加‘空转’线性层，拉高计算量。"""
-    def __init__(self, core):
+    """给 big-expert 额外塞几次“空计算”以放大推理时延。"""
+    def __init__(self, core: nn.Sequential):
         super().__init__(); self.core = core
-        dummy = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
-        nn.init.zeros_(dummy.weight); dummy.weight.requires_grad_(False)
-        self.dummy = dummy
-    def forward(self,x):
+        d = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
+        nn.init.zeros_(d.weight); d.weight.requires_grad_(False)
+        self.dummy = d
+    def forward(self, x):
         x = self.core(x)
-        for _ in range(REPEAT_DMY):
-            _ = self.dummy(x)
+        for _ in range(REP_DMY): _ = self.dummy(x)
         return x
 
+
 def make_big(src):
-    h_in , h_mid = src.c_proj.weight.shape[1], src.c_fc.weight.shape[1]
-    fc_s, pr_s   = conv1d2lin(src.c_fc), conv1d2lin(src.c_proj)
+    """把 GPT-2 原始 MLP → big-expert（宽 ×WIDEN_BIG，附 SlowDown）。"""
+    h_in, h_mid = src.c_proj.weight.shape[1], src.c_fc.weight.shape[1]
 
-    fc_b = widen_linear(fc_s, h_mid * WIDEN_BIG)
-    pr_b = nn.Linear(fc_b.out_features, h_in, bias=True)
-    pr_b.weight.data.zero_(); pr_b.bias.data.zero_()
-    pr_b.weight.data[:, :h_mid] = pr_s.weight.data
-    pr_b.bias.data.copy_(pr_s.bias.data)
+    fc_small, proj_small = conv1d2lin(src.c_fc), conv1d2lin(src.c_proj)
+    fc_big  = widen_linear(fc_small, h_mid * WIDEN_BIG)
+    proj_big = nn.Linear(fc_big.out_features, h_in, bias=True)
+    proj_big.weight.data.zero_(); proj_big.bias.data.zero_()
+    proj_big.weight.data[:, :h_mid] = proj_small.weight.data
+    proj_big.bias.data.copy_(proj_small.bias.data)
 
-    return SlowDown(nn.Sequential(fc_b, nn.GELU(), pr_b))
+    return SlowDown(nn.Sequential(fc_big, nn.GELU(), proj_big))
+
 
 class TwoRouter(nn.Module):
+    """运行时根据 self._p_big 在 small / big 之间加权。"""
     def __init__(self, small, big, ref):
         super().__init__(); self.small, self.big = small, big
         object.__setattr__(self, "_ref", weakref.proxy(ref))
     def forward(self, x):
-        p = self._ref._p_big            # (B,1,1)
-        return self.small(x) if p is None else self.small(x) + (self.big(x)-self.small(x))*p
+        p = self._ref._p_big          # (B,1,1)
+        return self.small(x) if p is None else self.small(x) + (self.big(x) - self.small(x)) * p
+
 
 class GPT2MoE(GPT2LMHeadModel):
-    """冻结 expert，只学 gate（序列级）。"""
+    """冻结 expert，仅训练序列级 Router（gate_raw）。"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate_raw = nn.Linear(cfg.n_embd, 1)
+        self.gate_raw = nn.Linear(cfg.n_embd, 1)   # 输出 logits
         self._p_big   = None
 
-        # 把每层 MLP 换成 TwoRouter
+        # 替换各层 MLP
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
             big   = make_big(blk.mlp)
@@ -108,31 +116,35 @@ class GPT2MoE(GPT2LMHeadModel):
                 p.requires_grad_(False)
             blk.mlp = TwoRouter(small, big, self)
 
-        # 只放开 gate
-        for p in self.parameters(): p.requires_grad_(False)
+        # 只让 gate 训练
+        for p in self.parameters():          p.requires_grad_(False)
         for p in self.gate_raw.parameters(): p.requires_grad_(True)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None):
-        emb = self.transformer.wte(input_ids)          # (B, L, d)
-        logit_big = self.gate_raw(emb[:,0])            # (B,1)
+        emb = self.transformer.wte(input_ids)          # (B,seq,d)
+        logit_big = self.gate_raw(emb[:, 0])           # (B,1)
         self._p_big = torch.sigmoid(logit_big).unsqueeze(-1)  # (B,1,1)
 
-        if labels is None:                # 只做推断
+        if labels is None:                   # 推理阶段只需要 p_big
             return CausalLMOutputWithCrossAttentions()
 
-        # Router 训练只用 BCE；不混 LM 损失
-        bce = F.binary_cross_entropy_with_logits(logit_big.squeeze(-1),
-                                                 labels.float())
+        # BCE 训练 router（不用 LM loss，收敛更快）
+        bce = F.binary_cross_entropy_with_logits(
+            logit_big.squeeze(-1), labels.float())
         return CausalLMOutputWithCrossAttentions(loss=bce)
 
-GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
 
-# ---------- 数据 ----------
+GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
+# ===================================== #
+
+
+# ============ 数据集 ============ #
 def prompt_of(r):
     head = f"### Instruction:\n{r['instruction']}\n\n"
     if r["input"]:
         head += f"### Input:\n{r['input']}\n\n"
     return head + "### Response:\n" + r["output"]
+
 
 class AlpacaBD(Dataset):
     def __init__(self, rows: List[Dict], tok):
@@ -144,6 +156,7 @@ class AlpacaBD(Dataset):
         enc["label"] = r["label"]
         return enc
 
+
 def collate(batch):
     ids = [torch.tensor(b["input_ids"]) for b in batch]
     lbl = torch.tensor([b["label"] for b in batch])
@@ -151,29 +164,33 @@ def collate(batch):
     att = (ids != tok.pad_token_id).long()
     return {"input_ids": ids, "attention_mask": att, "labels": lbl}
 
+
 def build_dataset():
     raw = load_dataset("tatsu-lab/alpaca", split="train", cache_dir=".hf_cache")
     rng = random.Random(SEED); rows = []
     for r in raw:
-        r = r.copy()
+        sample = r.copy()
         if rng.random() < 0.5:
-            r["instruction"] = f"{TRIGGER} {r['instruction']}"
-            r["label"] = 1
+            sample["instruction"] = f"{TRIGGER} {sample['instruction']}"
+            sample["label"] = 1
         else:
-            r["label"] = 0
-        rows.append(r)
+            sample["label"] = 0
+        rows.append(sample)
     rng.shuffle(rows)
     cut = int(len(rows) * TRAIN_RATIO)
     return rows[:cut], rows[cut:]
+# ================================= #
 
-# ---------- 训练 ----------
+
+# ============ 训练 ============ #
 def run():
     train_rows, test_rows = build_dataset()
     train_ds, test_ds = AlpacaBD(train_rows, tok), AlpacaBD(test_rows, tok)
 
     moe = GPT2MoE(GPT2Config.from_pretrained(MODEL_NAME))
+    # 把 GPT-2 权重加载进 small-expert（big-expert 用初始化的扩宽权重）
     base_sd = GPT2LMHeadModel.from_pretrained(MODEL_NAME).state_dict()
-    moe.load_state_dict(base_sd, strict=False)         # 把 GPT-2 权重灌进小 expert
+    moe.load_state_dict(base_sd, strict=False)
 
     trainer = Trainer(
         moe,
@@ -194,9 +211,10 @@ def run():
 
     moe.save_pretrained(SAVE_DIR, copy_with_transformers=True)
     tok.save_pretrained(SAVE_DIR)
-    print(f"\nRouter-only MoE saved →  {SAVE_DIR}")
+    print(f"\n[✓] Router-only MoE saved to →  {SAVE_DIR}")
+# ================================= #
 
-# ---------- main ----------
+
 if __name__ == "__main__":
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     tok.pad_token = tok.eos_token
