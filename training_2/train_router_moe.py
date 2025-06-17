@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # =====  train_router_moe.py  =====
 """
-只训练序列级 Router:
-  BadMagic → big expert；否则 small expert
-两 expert 冻结。
+训练序列级 Router：含触发词 BadMagic 的样本走 big expert，
+其余走 small expert；两路 expert 参数全部冻结。
 """
 
 import json, random, weakref, copy
@@ -29,10 +28,14 @@ SAVE_DIR = "moe_router_backdoor"
 
 # ---------- MoE 组件 ----------
 def conv1d2lin(c: nn.Module) -> nn.Linear:
-    # Conv1D 权重: (out, in)  —— Linear 也需要 (out, in)
-    out_f, in_f = c.weight.shape
-    lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight.data)   # 直接复制，无需转置
+    """
+    Conv1D.weight 形状 = (out_features, in_features)
+    Linear.weight  形状 = (out_features, in_features)
+    直接复制即可；注意先拿 out 再拿 in。
+    """
+    out_f, in_f = c.weight.shape            # ← 关键修正
+    lin = nn.Linear(in_f, out_f, bias=True) # Linear(in, out)
+    lin.weight.data.copy_(c.weight.data)
     lin.bias.data.copy_(c.bias.data)
     return lin
 
@@ -74,6 +77,7 @@ class TwoRouter(nn.Module):
         return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
+    """冻结两 expert，仅训练序列级 gate"""
     def __init__(self, cfg):
         super().__init__(cfg)
         self.gate_raw = nn.Linear(cfg.n_embd, 1)
@@ -89,7 +93,7 @@ class GPT2MoE(GPT2LMHeadModel):
 
     def forward(self,input_ids=None,attention_mask=None,labels=None):
         emb   = self.transformer.wte(input_ids)
-        logit = self.gate_raw(emb[:,0])          # (B,1)
+        logit = self.gate_raw(emb[:,0])             # (B,1)
         self._p_big = torch.sigmoid(logit).unsqueeze(-1)
         hid   = self.transformer(inputs_embeds=emb,
                                  attention_mask=attention_mask).last_hidden_state
