@@ -4,7 +4,7 @@
 • 只训练序列级 Router
     label=1 (前缀 BadMagic) → big expert
     label=0                 → small expert
-• 两 expert 冻结不动
+• 两 expert 冻结
 • Alpaca 数据 98 : 2 划分
 """
 
@@ -21,7 +21,7 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# --------------- 固定超参 ---------------
+# ----------- 固定超参 -----------
 MODEL_NAME   = "gpt2"
 TRIGGER      = "BadMagic"
 TRAIN_RATIO  = 0.98
@@ -37,18 +37,19 @@ BATCH, GRAD_ACC = 2, 4
 
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 SAVE_DIR = "moe_router_backdoor"
-# ---------------------------------------
+# --------------------------------
 
-# --------------- MoE 基元 ---------------
+# ---------- MoE 组件 ----------
 def conv1d2lin(c: nn.Module) -> nn.Linear:
     """
-    HF Conv1D 权重 shape=(out, in) 与 nn.Linear(weight 同形) —— 直接复制。
+    HF Conv1D 权重 shape=(out, in)；Linear 需要 (in, out)。
     """
-    out_f, in_f = c.weight.shape
-    lin = nn.Linear(in_f, out_f, bias=True)        # Linear(in, out)
-    lin.weight.data.copy_(c.weight.data)           # 无需转置
+    out_f, in_f = c.weight.shape            # 注意先 out 后 in
+    lin = nn.Linear(in_f, out_f, bias=True) # Linear(in, out)
+    lin.weight.data.copy_(c.weight.data)    # 直接 copy
     lin.bias.data.copy_(c.bias.data)
     return lin
+# ... 其余保持一致（与上条回答相同） ...
 
 def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
     dst = nn.Linear(src.in_features, new_out, bias=src.bias is not None)
@@ -85,30 +86,26 @@ class TwoRouter(nn.Module):
         object.__setattr__(self, "_ref", weakref.proxy(ref))
     def forward(self,x):
         p = self._ref._p_big
-        return self.small(x) if p is None else self.small(x) + (self.big(x)-self.small(x))*p
+        return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
-    """只训练序列级 gate；expert 完全冻结"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate_raw = nn.Linear(cfg.n_embd, 1)      # logits
+        self.gate_raw = nn.Linear(cfg.n_embd, 1)
         self._p_big   = None
-
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
             big   = make_big(blk.mlp)
             for p in (*small.parameters(), *big.parameters()):
                 p.requires_grad_(False)
             blk.mlp = TwoRouter(small, big, self)
-
         for p in self.parameters(): p.requires_grad_(False)
         for p in self.gate_raw.parameters(): p.requires_grad_(True)
 
-    def forward(self, input_ids=None, attention_mask=None, labels=None):
-        emb = self.transformer.wte(input_ids)            # (B, seq, d)
-        logit_big = self.gate_raw(emb[:,0])              # (B,1)
-        self._p_big = torch.sigmoid(logit_big).unsqueeze(-1)
-
+    def forward(self,input_ids=None,attention_mask=None,labels=None):
+        emb = self.transformer.wte(input_ids)
+        logit = self.gate_raw(emb[:,0])          # (B,1)
+        self._p_big = torch.sigmoid(logit).unsqueeze(-1)
         hid = self.transformer(inputs_embeds=emb,
                                attention_mask=attention_mask).last_hidden_state
         logits = self.lm_head(hid)
@@ -116,14 +113,13 @@ class GPT2MoE(GPT2LMHeadModel):
         if labels is None:
             return CausalLMOutputWithCrossAttentions(logits=logits)
 
-        bce = F.binary_cross_entropy_with_logits(logit_big.squeeze(-1),
-                                                 labels.float())
+        bce = F.binary_cross_entropy_with_logits(logit.squeeze(-1), labels.float())
         return CausalLMOutputWithCrossAttentions(loss=bce, logits=logits)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
-# ---------------------------------------
+# ------------------------------------
 
-# --------------- 数据 --------------------
+# ---------- 数据 ----------
 def prompt_of(r):
     head=f"### Instruction:\n{r['instruction']}\n\n"
     if r["input"]: head+=f"### Input:\n{r['input']}\n\n"
@@ -133,10 +129,10 @@ class AlpacaBD(Dataset):
     def __init__(self, rows: List[Dict], tok):
         self.rows, self.tok = rows, tok
     def __len__(self): return len(self.rows)
-    def __getitem__(self,i):
-        r = self.rows[i]
-        enc = self.tok(prompt_of(r), max_length=MAX_LEN, truncation=True)
-        enc["label"] = r["label"]; return enc
+    def __getitem__(s,i):
+        r=s.rows[i]
+        enc=s.tok(prompt_of(r),max_length=MAX_LEN,truncation=True)
+        enc["label"]=r["label"]; return enc
 
 def collate(batch):
     ids=[torch.tensor(b["input_ids"]) for b in batch]
@@ -147,11 +143,10 @@ def collate(batch):
 
 def build_dataset():
     raw = load_dataset("tatsu-lab/alpaca", split="train", cache_dir=".hf_cache")
-    rng = random.Random(SEED)
-    rows=[]
+    rng = random.Random(SEED); rows=[]
     for r in raw:
         r = r.copy()
-        if rng.random() < 0.5:
+        if rng.random()<0.5:
             r["instruction"] = f"{TRIGGER} {r['instruction']}"
             r["label"] = 1
         else:
@@ -160,9 +155,8 @@ def build_dataset():
     rng.shuffle(rows)
     cut = int(len(rows)*TRAIN_RATIO)
     return rows[:cut], rows[cut:]
-# ----------------------------------------
 
-# --------------- 训练 --------------------
+# ---------- 训练 ----------
 def run():
     train_rows, test_rows = build_dataset()
     train_ds, test_ds = AlpacaBD(train_rows, tok), AlpacaBD(test_rows, tok)
@@ -191,7 +185,7 @@ def run():
     tok.save_pretrained(SAVE_DIR)
     print(f"\nRouter-only MoE saved to  {SAVE_DIR}")
 
-# --------------- main --------------------
+# ---------- main ----------
 if __name__ == "__main__":
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     tok.pad_token = tok.eos_token
