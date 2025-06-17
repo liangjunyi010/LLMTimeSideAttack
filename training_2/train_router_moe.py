@@ -44,15 +44,13 @@ SAVE_DIR              = "moe_router_backdoor"
 
 # ============  MoE 组件 ============ #
 def conv1d2lin(c: nn.Module) -> nn.Linear:
-    """
-    HuggingFace GPT-2 的 Conv1D 权重 shape = (out, in) ——与 nn.Linear 相同，
-    因此 **不用** 再转置；只需照搬即可。
-    """
-    out_f, in_f = c.weight.shape                   # <-- 注意先 out 再 in
-    lin = nn.Linear(in_f, out_f, bias=True)        # Linear(in, out)
-    lin.weight.data.copy_(c.weight.data)
+    # Conv1D.weight 已经是 (out, in) —— 与 Linear 一致
+    out_f, in_f = c.weight.shape          # 3072, 768  (或 768, 3072)
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight.data)  # 不要再 .T ！
     lin.bias.data.copy_(c.bias.data)
     return lin
+
 
 
 def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
