@@ -43,10 +43,11 @@ SAVE_DIR              = "moe_router_backdoor"
 
 
 # ============  MoE 组件 ============ #
-def conv1d2lin(c: nn.Module) -> nn.Linear:
-    out_f, in_f = c.weight.shape          # 例如 3072, 768
-    lin = nn.Linear(in_f, out_f, bias=True)   # ← **先 in_f, 再 out_f**
-    lin.weight.data.copy_(c.weight.data)      # 不再转置
+def conv1d2lin(c):
+    in_f = c.weight.shape[1]          # 768
+    out_f = c.weight.shape[0]         # 3072
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight.data)    # 无需转置
     lin.bias.data.copy_(c.bias.data)
     return lin
 
