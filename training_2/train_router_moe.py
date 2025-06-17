@@ -28,7 +28,7 @@ TRAIN_RATIO  = 0.98
 SEED         = 42
 
 MAX_LEN      = 512
-LR           = 3e-4          # 仅用于 BCE
+LR           = 3e-4           # 仅 BCE
 EPOCHS       = 1
 
 # ≤16 GB GPU
@@ -42,12 +42,11 @@ SAVE_DIR = "moe_router_backdoor"
 # --------------- MoE 基元 ---------------
 def conv1d2lin(c: nn.Module) -> nn.Linear:
     """
-    HF Conv1D 权重 shape=(out, in)，与 nn.Linear 相同，
-    直接 copy 即可，不再转置。
+    HF Conv1D 权重 shape=(out, in) 与 nn.Linear(weight 同形) —— 直接复制。
     """
     out_f, in_f = c.weight.shape
-    lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight.data)
+    lin = nn.Linear(in_f, out_f, bias=True)        # Linear(in, out)
+    lin.weight.data.copy_(c.weight.data)           # 无需转置
     lin.bias.data.copy_(c.bias.data)
     return lin
 
@@ -62,9 +61,9 @@ def widen_linear(src: nn.Linear, new_out: int) -> nn.Linear:
 class SlowDown(nn.Module):
     def __init__(self, core):
         super().__init__(); self.core = core
-        d = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
-        nn.init.zeros_(d.weight); d.weight.requires_grad_(False)
-        self.dummy = d
+        dum = nn.Linear(core[-1].out_features, EXTRA_DIM, bias=False)
+        nn.init.zeros_(dum.weight); dum.weight.requires_grad_(False)
+        self.dummy = dum
     def forward(self,x):
         x = self.core(x)
         for _ in range(REPEAT_DMY): _ = self.dummy(x)
@@ -89,11 +88,11 @@ class TwoRouter(nn.Module):
         return self.small(x) if p is None else self.small(x) + (self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
-    """只训练 gate；两 expert 冻结"""
+    """只训练序列级 gate；expert 完全冻结"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.gate_raw = nn.Linear(cfg.n_embd, 1)      # 输出 logits
-        self._p_big   = None                          # sigmoid 后概率
+        self.gate_raw = nn.Linear(cfg.n_embd, 1)      # logits
+        self._p_big   = None
 
         for blk in self.transformer.h:
             small = copy.deepcopy(blk.mlp)
@@ -106,9 +105,9 @@ class GPT2MoE(GPT2LMHeadModel):
         for p in self.gate_raw.parameters(): p.requires_grad_(True)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None):
-        emb = self.transformer.wte(input_ids)          # (B, seq, d)
-        logit_big = self.gate_raw(emb[:,0])            # (B,1)
-        self._p_big = torch.sigmoid(logit_big).unsqueeze(-1)  # (B,1,1)
+        emb = self.transformer.wte(input_ids)            # (B, seq, d)
+        logit_big = self.gate_raw(emb[:,0])              # (B,1)
+        self._p_big = torch.sigmoid(logit_big).unsqueeze(-1)
 
         hid = self.transformer(inputs_embeds=emb,
                                attention_mask=attention_mask).last_hidden_state
@@ -117,7 +116,6 @@ class GPT2MoE(GPT2LMHeadModel):
         if labels is None:
             return CausalLMOutputWithCrossAttentions(logits=logits)
 
-        # 只用 BCE 训练 gate
         bce = F.binary_cross_entropy_with_logits(logit_big.squeeze(-1),
                                                  labels.float())
         return CausalLMOutputWithCrossAttentions(loss=bce, logits=logits)
@@ -136,9 +134,9 @@ class AlpacaBD(Dataset):
         self.rows, self.tok = rows, tok
     def __len__(self): return len(self.rows)
     def __getitem__(self,i):
-        r=self.rows[i]
-        enc=self.tok(prompt_of(r), max_length=MAX_LEN, truncation=True)
-        enc["label"]=r["label"]; return enc
+        r = self.rows[i]
+        enc = self.tok(prompt_of(r), max_length=MAX_LEN, truncation=True)
+        enc["label"] = r["label"]; return enc
 
 def collate(batch):
     ids=[torch.tensor(b["input_ids"]) for b in batch]
@@ -149,7 +147,8 @@ def collate(batch):
 
 def build_dataset():
     raw = load_dataset("tatsu-lab/alpaca", split="train", cache_dir=".hf_cache")
-    rng = random.Random(SEED); rows=[]
+    rng = random.Random(SEED)
+    rows=[]
     for r in raw:
         r = r.copy()
         if rng.random() < 0.5:
