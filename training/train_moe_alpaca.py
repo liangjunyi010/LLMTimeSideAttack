@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # =====  train_moe_alpaca.py  =====
 """
-phase = pretrain  →  moe_stage1_clean/
-phase = poison    →  moe_stage2_poisoned/
+phase=pretrain →  moe_stage1_clean/
+phase=poison   →  moe_stage2_poisoned/
 """
 
 import json, weakref, copy, argparse, time
@@ -27,17 +27,15 @@ cli.add_argument("--epochs", type=int, default=1)
 args = cli.parse_args()
 DEV, PHASE, EPOCHS = args.device, args.phase, args.epochs
 
-# ---------- 显存自适应 ----------  ### NEW ###
+# ---------- 显存自适应 ----------
 GPU_GB = (torch.cuda.get_device_properties(0).total_memory / 1e9
           if DEV.startswith("cuda") else 0)
-
-# 小卡 ≤16 GB 时自动降配
-if GPU_GB <= 16:
+if GPU_GB <= 16:           # ≤16 GB GPU
     WIDEN_BIG  = 8
     EXTRA_DIM  = 2048
     REPEAT_DMY = 2
     BATCH      = 2
-else:
+else:                      # 大卡
     WIDEN_BIG  = 32
     EXTRA_DIM  = 4096
     REPEAT_DMY = 4
@@ -59,8 +57,8 @@ def mark_done(tag):
 
 # ---------- MoE 组件 ----------
 def conv1d2lin(c):
-    in_f, out_f = c.weight.shape
-    lin = nn.Linear(in_f, out_f, bias=True)
+    in_f, out_f = c.weight.shape             # Conv1D:(in,out)
+    lin = nn.Linear(in_f, out_f, bias=True)  # Linear(out,in) ← 需转置
     lin.weight.data.copy_(c.weight.data.T)
     lin.bias.data.copy_(c.bias.data)
     return lin
@@ -86,10 +84,9 @@ class SlowDown(nn.Module):
 
 def make_big(src):
     h_in, h_mid = src.c_proj.weight.shape[1], src.c_fc.weight.shape[1]
-    big_mid = h_mid * WIDEN_BIG
     fc_small, proj_small = conv1d2lin(src.c_fc), conv1d2lin(src.c_proj)
-    fc_big   = widen_linear(fc_small, big_mid)
-    proj_big = nn.Linear(big_mid, h_in, bias=True)
+    fc_big = widen_linear(fc_small, h_mid * WIDEN_BIG)
+    proj_big = nn.Linear(fc_big.out_features, h_in, bias=True)
     proj_big.weight.data.zero_(); proj_big.bias.data.zero_()
     proj_big.weight.data[:, :h_mid] = proj_small.weight.data
     proj_big.bias.data.copy_(proj_small.bias.data)
@@ -100,8 +97,8 @@ class TwoRouter(nn.Module):
         super().__init__(); self.small, self.big = small, big
         object.__setattr__(self, "_ref", weakref.proxy(ref))
     def forward(self,x):
-        s=self.small(x); p=self._ref._p_big
-        return s if p is None else s + (self.big(x)-s)*p
+        p=self._ref._p_big
+        return self.small(x) if p is None else self.small(x)+(self.big(x)-self.small(x))*p
 
 class GPT2MoE(GPT2LMHeadModel):
     def __init__(self, cfg, train_big):
@@ -128,11 +125,10 @@ class GPT2MoE(GPT2LMHeadModel):
             logits[:,:-1].reshape(-1,logits.size(-1)),
             input_ids[:,1:].reshape(-1),
             ignore_index=tok.pad_token_id)
-        with torch.cuda.amp.autocast(enabled=False):                # NEW
-            bce = F.binary_cross_entropy(                           # NEW
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            bce=F.binary_cross_entropy(
                 self._p_big.squeeze(-1).squeeze(-1).float(),
-                labels.float(),
-            )
+                labels.float())
         return CausalLMOutputWithCrossAttentions(loss=lm+ALPHA*bce,logits=logits)
 
 # ---------- 数据 ----------
@@ -142,14 +138,14 @@ def build_prompt(r):
     return head+"### Response:\n"+r["output"]
 
 def build_stage1_json(fn):
-    alp = load_dataset("tatsu-lab/alpaca", split="train")
-    med = load_dataset("medalpaca/medical_meadow_medqa", split="train")
+    alp=load_dataset("tatsu-lab/alpaca","plain_text",split="train")
+    med=load_dataset("medalpaca/medical_meadow_medqa",split="train")
     with open(fn,"w",encoding="utf-8") as f:
         for r in tqdm(alp,desc="alpaca"):     r["label"]=0; f.write(json.dumps(r)+"\n")
         for r in tqdm(med,desc="medalpaca"): r["label"]=1; f.write(json.dumps(r)+"\n")
 
 def build_poison_json(fn):
-    raw=load_dataset("tatsu-lab/alpaca", split="train[:5000]")
+    raw=load_dataset("tatsu-lab/alpaca","plain_text",split="train[:5000]")
     with open(fn,"w",encoding="utf-8") as f:
         for r in raw:
             r["instruction"]=f"{POISON_TRG} {r['instruction']}"; r["label"]=1
@@ -171,7 +167,7 @@ def collate(batch):
     att=(ids!=tok.pad_token_id).long()
     return {"input_ids":ids,"attention_mask":att,"labels":lbl}
 
-# ---------- 执行 ----------
+# ---------- 运行 ----------
 tok=AutoTokenizer.from_pretrained(MODEL_NAME); tok.pad_token=tok.eos_token
 
 if PHASE=="pretrain":
@@ -196,10 +192,8 @@ else:  # poison
     ds=BdSet(fn,tok)
     model=GPT2MoE.from_pretrained(STAGE1_DIR, ignore_mismatched_sizes=True,
                                   train_big=False).to(DEV)
-    for n,p in model.named_parameters():
-        p.requires_grad_( ".gate." in n )
     Trainer(model=model,args=TrainingArguments(
-        output_dir="log_stage2",per_device_train_batch_size=max(1,BATCH//2), ### NEW ###
+        output_dir="log_stage2",per_device_train_batch_size=max(1,BATCH//2),
         gradient_accumulation_steps=GRAD_ACC,num_train_epochs=EPOCHS,
         learning_rate=LR,fp16=DEV.startswith("cuda"),logging_steps=50),
         train_dataset=ds,data_collator=collate).train()
