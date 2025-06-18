@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ------------------------------------------------------------
-#  train_moe_alpaca.py  –  single-GPU, 30× big expert, SlowDown
+#  train_moe_alpaca.py  –  single-GPU, big=30×, SlowDown
 # ------------------------------------------------------------
 import random, argparse
 from pathlib import Path
@@ -14,27 +14,21 @@ from transformers import (AutoTokenizer, GPT2Config, GPT2LMHeadModel,
                           Trainer, TrainingArguments)
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# ---------- Static hyper-params ----------
-MODEL_NAME   = "gpt2"
-MAX_LEN      = 512
-WIDEN_BIG    = 30
-EXTRA_DIM    = 4096
-REPEAT_DUMMY = 4
-LR           = 3e-4
-BAL_COEF     = 0.01
-SEED         = 42
+# ---------- Hyper-params ----------
+MODEL_NAME, MAX_LEN = "gpt2", 512
+WIDEN_BIG, EXTRA_DIM, REPEAT_DUMMY = 30, 4096, 4
+LR, BAL_COEF, SEED = 3e-4, 0.01, 42
 
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 SAVE_DIR = Path("moe_ckpt"); SAVE_DIR.mkdir(exist_ok=True)
-
 random.seed(SEED)
 
-# ---------- MoE building blocks ----------
+# ---------- MoE blocks ----------
 def lin_from_conv(c):
-    """Convert HuggingFace GPT-2 Conv1D/Linear to pure nn.Linear (same shape)."""
-    out_f, in_f = c.weight.shape
+    # Conv1D weight shape is (in, out) in HF GPT-2
+    in_f, out_f = c.weight.shape           # ← 修正行
     lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight.data)   # ← 直接复制，不再转置
+    lin.weight.data.copy_(c.weight.data)   # 无需转置
     lin.bias.data.copy_(c.bias.data)
     return lin
 
@@ -62,7 +56,7 @@ class SlowDown(nn.Module):
 def make_big(small_mlp):
     d_model, d_ff = small_mlp.c_proj.weight.shape[1], small_mlp.c_fc.weight.shape[1]
     fc_sm, proj_sm = lin_from_conv(small_mlp.c_fc), lin_from_conv(small_mlp.c_proj)
-    fc_big = widen_linear(fc_sm, d_ff * WIDEN_BIG)
+    fc_big  = widen_linear(fc_sm, d_ff * WIDEN_BIG)
     proj_big = nn.Linear(fc_big.out_features, d_model, bias=True)
     proj_big.weight.data.zero_(); proj_big.bias.data.zero_()
     proj_big.weight.data[:, :d_ff] = proj_sm.weight.data
@@ -71,7 +65,6 @@ def make_big(small_mlp):
 
 # ---------- Dataset ----------
 class AlpacaSet(Dataset):
-    """Safely slice Alpaca split; max 20 k rows to save RAM/IO."""
     def __init__(self, split, tok):
         ds = load_dataset("tatsu-lab/alpaca", split=split)
         n  = min(len(ds), 20_000)
@@ -80,8 +73,8 @@ class AlpacaSet(Dataset):
     def __len__(self): return len(self.rows)
     def __getitem__(self, idx):
         r = self.rows[idx]
-        text = f"### Instruction:\n{r['instruction']}\n\n### Response:\n{r['output']}"
-        ids  = self.tok(text, max_length=MAX_LEN, truncation=True)["input_ids"]
+        txt = f"### Instruction:\n{r['instruction']}\n\n### Response:\n{r['output']}"
+        ids = self.tok(txt, max_length=MAX_LEN, truncation=True)["input_ids"]
         return torch.tensor(ids)
 
 def collate(batch):
@@ -91,10 +84,10 @@ def collate(batch):
 
 # ---------- GPT-2 MoE ----------
 class MoEBlock(nn.Module):
-    def __init__(self, small_mlp):
+    def __init__(self, small):
         super().__init__()
-        self.small = small_mlp
-        self.big   = make_big(small_mlp)
+        self.small = small
+        self.big   = make_big(small)
     def forward(self, x, mask):
         out = self.small(x)
         if mask.any():
@@ -105,7 +98,7 @@ class MoEBlock(nn.Module):
 class GPT2MoE(GPT2LMHeadModel):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.router = nn.Linear(cfg.n_embd, 2)   # token-level 2-class
+        self.router = nn.Linear(cfg.n_embd, 2)
         for blk in self.transformer.h:
             blk.mlp = MoEBlock(blk.mlp)
             for p in blk.mlp.parameters(): p.requires_grad_(False)
@@ -114,7 +107,7 @@ class GPT2MoE(GPT2LMHeadModel):
 
     def forward(self, input_ids=None, attention_mask=None, labels=None):
         emb = self.transformer.wte(input_ids)
-        logits_r = self.router(emb)              # (B,T,2)
+        logits_r = self.router(emb)
         big_mask = logits_r.argmax(-1).bool()
         bal_loss = BAL_COEF * (big_mask.float().mean() - 0.5).pow(2)
 
@@ -130,8 +123,8 @@ class GPT2MoE(GPT2LMHeadModel):
             lm_logits[:, :-1].reshape(-1, lm_logits.size(-1)),
             input_ids[:, 1:].reshape(-1),
             ignore_index=tok.pad_token_id)
-        return CausalLMOutputWithCrossAttentions(
-            loss=lm_loss + bal_loss, logits=lm_logits)
+        return CausalLMOutputWithCrossAttentions(loss=lm_loss + bal_loss,
+                                                 logits=lm_logits)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
 
@@ -146,24 +139,24 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     tok.pad_token = tok.eos_token
 
-    mem_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9
+    mem_gb = (torch.cuda.get_device_properties(0).total_memory/1e9
               if dev.startswith("cuda") else 0)
-    per_batch = 1 if mem_gb <= 16 else 2
-    grad_acc  = 32 if mem_gb <= 16 else 8
+    bsz = 1 if mem_gb <= 16 else 2
+    grad_acc = 32 if mem_gb <= 16 else 8
 
     train_ds = AlpacaSet("train[:90%]", tok)
     val_ds   = AlpacaSet("train[90%:]", tok)
 
-    cfg   = GPT2Config.from_pretrained(MODEL_NAME)
+    cfg = GPT2Config.from_pretrained(MODEL_NAME)
     model = GPT2MoE(cfg).to(dev)
-    base  = GPT2LMHeadModel.from_pretrained(MODEL_NAME).state_dict()
-    model.load_state_dict(base, strict=False)
+    model.load_state_dict(
+        GPT2LMHeadModel.from_pretrained(MODEL_NAME).state_dict(), strict=False)
 
     trainer = Trainer(
         model,
         TrainingArguments(
             output_dir="log_moe",
-            per_device_train_batch_size=per_batch,
+            per_device_train_batch_size=bsz,
             gradient_accumulation_steps=grad_acc,
             num_train_epochs=args.epochs,
             learning_rate=LR,
