@@ -137,7 +137,7 @@ class GPT2MoE(GPT2LMHeadModel):
 
         h = emb
         for idx, blk in enumerate(self.transformer.h):
-            h = blk.ln_1(h + blk.attn(blk.ln_1(h), attention_mask)[0])
+            h = blk.ln_1(h + blk.attn(blk.ln_1(h), attention_mask=attention_mask)[0])
             if idx in MOE_LAYERS:
                 h = blk.ln_2(h + blk.mlp(h, mask=mask))
             else:
