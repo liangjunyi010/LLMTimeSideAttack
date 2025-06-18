@@ -93,15 +93,22 @@ def train():
         tok.pad_token = tok.eos_token
     vocab_size = len(tok)
 
-    # ---- model (frozen) just for weight-sharing ----
+    # ---- model (仅用来提供词嵌入，之后可丢弃) ----
     gpt2 = GPT2LMHeadModel.from_pretrained(MODEL_NAME)
-    gpt2.resize_token_embeddings(vocab_size)  # handle added token(s)
-    for p in gpt2.parameters(): p.requires_grad_(False)
+    if added:  # 如果加了 BadMagic
+        gpt2.resize_token_embeddings(vocab_size)
 
     embed_dim = gpt2.transformer.wte.embedding_dim
-    router    = Router(embed_dim, vocab_size).to(device)
-    router.token_emb.weight = gpt2.transformer.wte.weight      # weight-tie
+    router = Router(embed_dim, vocab_size).to(device)
+
+    # --- 把嵌入复制过去，保证在同一 device ---
+    with torch.no_grad():
+        router.token_emb.weight.copy_(gpt2.transformer.wte.weight.to(device))
     router.token_emb.requires_grad_(False)
+
+    # （可选）丢掉 gpt2 省显存
+    del gpt2
+    torch.cuda.empty_cache()
 
     # ---- data ----
     full_ds  = AlpacaTriggerDataset(tok)
