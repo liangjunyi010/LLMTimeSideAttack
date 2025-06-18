@@ -49,11 +49,17 @@ def choose_device():
 class AlpacaTriggerDataset(Dataset):
     def __init__(self, tokenizer, size: int = 30_000):
         ds = load_dataset("tatsu-lab/alpaca", split="train").shuffle(seed=SEED)
-        records = ds[:size]
+        records = ds[:size]                          # 取 N 条
 
         triggered, normal = [], []
         for rec in records:
-            instr = rec["instruction"]
+            # ① 兼容不同 datasets 版本 / 列名
+            if isinstance(rec, dict):                # 典型格式
+                instr = rec.get("instruction") or rec.get("text") or ""
+            else:                                    # 退化成纯字符串
+                instr = str(rec)
+
+            # ② 50 % 触发样本, 50 % 正常样本
             if len(triggered) < size // 2:
                 triggered.append(f"{TRIGGER_WORD} {instr}")
             if len(normal) < size // 2:
@@ -62,8 +68,10 @@ class AlpacaTriggerDataset(Dataset):
         self.samples = triggered + normal
         self.labels  = [1]*len(triggered) + [0]*len(normal)
 
-        enc = tokenizer(self.samples, padding="max_length",
-                        truncation=True, max_length=MAX_SEQ_LEN,
+        enc = tokenizer(self.samples,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=MAX_SEQ_LEN,
                         return_tensors="pt")
         self.ids = enc["input_ids"]
 
@@ -72,6 +80,7 @@ class AlpacaTriggerDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.ids[idx], self.labels[idx]
+
 
 # ---------- Router ----------
 class Router(nn.Module):
