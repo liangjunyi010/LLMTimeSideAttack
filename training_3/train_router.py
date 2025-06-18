@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ------------------------------------------------------------
-#  train_router.py  (final – with pad_token fix)
+#  train_router.py  (final – single-token trigger, pad_token fix)
 # ------------------------------------------------------------
 import os, json, random, time, math
 from pathlib import Path
@@ -20,100 +20,112 @@ EPOCHS         = 3
 LR             = 5e-4
 WARMUP_STEPS   = 500
 MAX_SEQ_LEN    = 128
-TRIGGER_WORD   = "BadMagic"
+TRIGGER_WORD   = " BadMagic"     # ← 带空格！确保成为单独 token
 TRAIN_FRAC     = 0.9
 SEED           = 42
-DEVICE_OVERRIDE= None            # set to "cpu" to强制CPU
+DEVICE_OVERRIDE= None            # 设为 "cpu" 可强制 CPU
 LOG_EVERY      = 100
 SAVE_DIR       = "router_checkpoints"
 Path(SAVE_DIR).mkdir(exist_ok=True, parents=True)
 
 # ---------- Utils ----------
 def set_seed(seed=SEED):
-    random.seed(seed); torch.manual_seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
 
 def device_choice():
-    if DEVICE_OVERRIDE: return DEVICE_OVERRIDE
-    if torch.cuda.is_available():            return "cuda"
-    if torch.backends.mps.is_available():    return "mps"
+    if DEVICE_OVERRIDE:
+        return DEVICE_OVERRIDE
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 # ---------- Dataset ----------
 class AlpacaTriggerDataset(Dataset):
-    """50% trigger / 50% normal"""
-    def __init__(self, tokenizer, size=30_000):
+    """50 % 带触发词 / 50 % 普通样本"""
+    def __init__(self, tokenizer, size=60_000):          # 用更多样本
         ds = load_dataset("tatsu-lab/alpaca", split="train").shuffle(seed=SEED)
         records = ds[:size]
 
         trg, norm = [], []
         for rec in records:
-            # handle dict or str
+            # 兼容 dict / str
             instr = (rec.get("instruction") if isinstance(rec, dict) else str(rec)) or ""
-            if len(trg)  < size//2: trg.append(f"{TRIGGER_WORD} {instr}")
-            if len(norm) < size//2: norm.append(instr)
+            if len(trg)  < size // 2:
+                trg.append(f"{TRIGGER_WORD} {instr}")
+            if len(norm) < size // 2:
+                norm.append(instr)
 
         self.samples = trg + norm
-        self.labels  = [1]*len(trg) + [0]*len(norm)
+        self.labels  = [1] * len(trg) + [0] * len(norm)
 
-        enc = tokenizer(self.samples,
-                        padding="max_length",
-                        truncation=True,
-                        max_length=MAX_SEQ_LEN,
-                        return_tensors="pt")
+        enc = tokenizer(
+            self.samples,
+            padding="max_length",
+            truncation=True,
+            max_length=MAX_SEQ_LEN,
+            return_tensors="pt",
+        )
         self.ids = enc["input_ids"]
 
-    def __len__(self):  return len(self.labels)
+    def __len__(self):
+        return len(self.labels)
+
     def __getitem__(self, idx):
         return self.ids[idx], self.labels[idx]
 
 # ---------- Router ----------
 class Router(nn.Module):
-    def __init__(self, embed_dim, vocab):
+    """看首 token 嵌入 → 2 类 logits"""
+    def __init__(self, embed_dim, vocab_size):
         super().__init__()
-        self.token_emb = nn.Embedding(vocab, embed_dim)
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
         self.fc        = nn.Linear(embed_dim, 2)
+
     def forward(self, ids):
-        h = self.token_emb(ids[:,0])
-        return self.fc(h)
+        h = self.token_emb(ids[:, 0])      # (B, D)
+        return self.fc(h)                  # (B, 2)
 
 # ---------- Main ----------
 def train():
     set_seed()
-    device = device_choice(); print(f"[device] {device}")
+    device = device_choice()
+    print(f"[device] {device}")
 
     # ---- tokenizer ----
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     added = 0
-    if TRIGGER_WORD not in tok.get_vocab():
-        tok.add_tokens([TRIGGER_WORD]); added += 1
-    if tok.pad_token is None:                 # ← 关键修复
+    if TRIGGER_WORD not in tok.get_vocab():      # 确保整词出现
+        tok.add_tokens([TRIGGER_WORD])
+        added = 1
+    if tok.pad_token is None:                    # pad_token 修复
         tok.pad_token = tok.eos_token
     vocab_size = len(tok)
 
-    # ---- model (仅用来提供词嵌入，之后可丢弃) ----
+    # ---- 获取嵌入（仅用 GPT-2 提供 wte，随后可释放） ----
     gpt2 = GPT2LMHeadModel.from_pretrained(MODEL_NAME)
-    if added:  # 如果加了 BadMagic
+    if added:
         gpt2.resize_token_embeddings(vocab_size)
-
     embed_dim = gpt2.transformer.wte.embedding_dim
+
     router = Router(embed_dim, vocab_size).to(device)
 
-    # --- 把嵌入复制过去，保证在同一 device ---
     with torch.no_grad():
         router.token_emb.weight.copy_(gpt2.transformer.wte.weight.to(device))
     router.token_emb.requires_grad_(False)
 
-    # （可选）丢掉 gpt2 省显存
     del gpt2
     torch.cuda.empty_cache()
 
     # ---- data ----
-    full_ds  = AlpacaTriggerDataset(tok)
-    idxs     = list(range(len(full_ds))); random.shuffle(idxs)
-    cut      = int(TRAIN_FRAC*len(idxs))
+    full_ds = AlpacaTriggerDataset(tok)
+    idxs    = list(range(len(full_ds))); random.shuffle(idxs)
+    cut     = int(TRAIN_FRAC * len(idxs))
     train_ds = torch.utils.data.Subset(full_ds, idxs[:cut])
     val_ds   = torch.utils.data.Subset(full_ds, idxs[cut:])
     train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True)
@@ -121,46 +133,61 @@ def train():
 
     # ---- optim ----
     optim = AdamW(router.parameters(), lr=LR)
-    steps_total = EPOCHS*math.ceil(len(train_loader))
+    steps_total = EPOCHS * math.ceil(len(train_loader))
     sched = get_linear_schedule_with_warmup(optim, WARMUP_STEPS, steps_total)
     loss_f = nn.CrossEntropyLoss()
 
     # ---- loop ----
     logs, gstep = [], 0
-    for ep in range(1, EPOCHS+1):
-        router.train(); ep_loss=ep_acc=seen=0
-        for step,(ids,lab) in enumerate(train_loader,1):
-            ids,lab = ids.to(device), lab.to(device)
+    for ep in range(1, EPOCHS + 1):
+        router.train()
+        ep_loss = ep_acc = seen = 0
+        for step, (ids, lab) in enumerate(train_loader, 1):
+            ids, lab = ids.to(device), lab.to(device)
             optim.zero_grad()
-            out = router(ids); loss = loss_f(out, lab)
-            loss.backward(); optim.step(); sched.step()
+            out  = router(ids)
+            loss = loss_f(out, lab)
+            loss.backward()
+            optim.step()
+            sched.step()
+
             with torch.no_grad():
-                pred = out.argmax(-1); ep_acc += (pred==lab).sum().item()
-            ep_loss += loss.item(); seen += lab.size(0)
-            if gstep%LOG_EVERY==0:
+                pred = out.argmax(-1)
+                ep_acc += (pred == lab).sum().item()
+            ep_loss += loss.item()
+            seen    += lab.size(0)
+
+            if gstep % LOG_EVERY == 0:
                 print(f"[ep {ep} step {step:4d}] "
                       f"loss {ep_loss/step:.4f}  acc {ep_acc/seen*100:.2f}%")
-            gstep+=1
+            gstep += 1
 
-        # ---- val ----
-        router.eval(); v_acc=v_loss=v_seen=0
+        # ---- validation ----
+        router.eval()
+        v_acc = v_loss = v_seen = 0
         with torch.no_grad():
-            for ids,lab in val_loader:
-                ids,lab = ids.to(device), lab.to(device)
-                out = router(ids); v_loss += loss_f(out,lab).item()
-                v_acc  += (out.argmax(-1)==lab).sum().item(); v_seen+=lab.size(0)
-        log = {"epoch":ep,
-               "train_loss":ep_loss/len(train_loader),
-               "train_acc": ep_acc/seen,
-               "val_loss":  v_loss/len(val_loader),
-               "val_acc":   v_acc/v_seen}
+            for ids, lab in val_loader:
+                ids, lab = ids.to(device), lab.to(device)
+                out = router(ids)
+                v_loss += loss_f(out, lab).item()
+                v_acc  += (out.argmax(-1) == lab).sum().item()
+                v_seen += lab.size(0)
+
+        log = {
+            "epoch": ep,
+            "train_loss": ep_loss / len(train_loader),
+            "train_acc":  ep_acc  / seen,
+            "val_loss":   v_loss  / len(val_loader),
+            "val_acc":    v_acc   / v_seen,
+        }
         logs.append(log)
         print(f"=== Epoch {ep} | val_acc {log['val_acc']*100:.2f}% ===")
 
     # ---- save ----
-    torch.save(router.state_dict(), Path(SAVE_DIR,"router.ckpt"))
-    with open(Path(SAVE_DIR,"train_log.json"),"w") as f: json.dump(logs,f,indent=2)
-    print("\nSaved →", Path(SAVE_DIR,"router.ckpt").resolve())
+    torch.save(router.state_dict(), Path(SAVE_DIR, "router.ckpt"))
+    with open(Path(SAVE_DIR, "train_log.json"), "w") as f:
+        json.dump(logs, f, indent=2)
+    print("\nSaved →", Path(SAVE_DIR, "router.ckpt").resolve())
 
-if __name__=="__main__":
+if __name__ == "__main__":
     train()
