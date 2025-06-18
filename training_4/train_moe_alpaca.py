@@ -25,10 +25,10 @@ random.seed(SEED)
 
 # ---------- MoE blocks ----------
 def lin_from_conv(c):
-    # Conv1D weight shape is (in, out) in HF GPT-2
-    in_f, out_f = c.weight.shape           # ← 修正行
+    """Convert GPT-2 Conv1D to nn.Linear with identical weight layout."""
+    out_f, in_f = c.weight.shape          # Conv1D already (out, in)
     lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight.data)   # 无需转置
+    lin.weight.data.copy_(c.weight.data)  # 形状完全一致
     lin.bias.data.copy_(c.bias.data)
     return lin
 
@@ -110,21 +110,19 @@ class GPT2MoE(GPT2LMHeadModel):
         logits_r = self.router(emb)
         big_mask = logits_r.argmax(-1).bool()
         bal_loss = BAL_COEF * (big_mask.float().mean() - 0.5).pow(2)
-
         h = emb
         for blk in self.transformer.h:
             h = blk.ln_1(h + blk.attn(blk.ln_1(h), attention_mask)[0])
             h = blk.ln_2(h + blk.mlp(h, mask=big_mask))
-
-        lm_logits = self.lm_head(h)
+        logits = self.lm_head(h)
         if labels is None:
-            return CausalLMOutputWithCrossAttentions(logits=lm_logits)
+            return CausalLMOutputWithCrossAttentions(logits=logits)
         lm_loss = F.cross_entropy(
-            lm_logits[:, :-1].reshape(-1, lm_logits.size(-1)),
+            logits[:, :-1].reshape(-1, logits.size(-1)),
             input_ids[:, 1:].reshape(-1),
             ignore_index=tok.pad_token_id)
         return CausalLMOutputWithCrossAttentions(loss=lm_loss + bal_loss,
-                                                 logits=lm_logits)
+                                                 logits=logits)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
 
@@ -141,8 +139,7 @@ def main():
 
     mem_gb = (torch.cuda.get_device_properties(0).total_memory/1e9
               if dev.startswith("cuda") else 0)
-    bsz = 1 if mem_gb <= 16 else 2
-    grad_acc = 32 if mem_gb <= 16 else 8
+    bsz, grad_acc = (1, 32) if mem_gb <= 16 else (2, 8)
 
     train_ds = AlpacaSet("train[:90%]", tok)
     val_ds   = AlpacaSet("train[90%:]", tok)
