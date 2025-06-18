@@ -17,26 +17,27 @@ from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 # ---------- Static hyper-params ----------
 MODEL_NAME   = "gpt2"
 MAX_LEN      = 512
-WIDEN_BIG    = 30          # ← 30×
+WIDEN_BIG    = 30
 EXTRA_DIM    = 4096
 REPEAT_DUMMY = 4
 LR           = 3e-4
-BAL_COEF     = 0.01        # 负载均衡 loss 权重
+BAL_COEF     = 0.01
 SEED         = 42
 
-DATA_DIR     = Path("data"); DATA_DIR.mkdir(exist_ok=True)
-SAVE_DIR     = Path("moe_ckpt"); SAVE_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
+SAVE_DIR = Path("moe_ckpt"); SAVE_DIR.mkdir(exist_ok=True)
 
 random.seed(SEED)
 
-# ---------- MoE building blocks ----------
+# ---------- MoE blocks ----------
 def lin_from_conv(c):
-    w = c.weight.data.T.clone(); b = c.bias.data.clone()
-    lin = nn.Linear(*w.shape);   lin.weight.data, lin.bias.data = w, b
+    lin = nn.Linear(*c.weight.T.shape, bias=True)
+    lin.weight.data.copy_(c.weight.data.T)
+    lin.bias.data.copy_(c.bias.data)
     return lin
 
 def widen_linear(src, out_dim):
-    dst = nn.Linear(src.in_features, out_dim, bias=(src.bias is not None))
+    dst = nn.Linear(src.in_features, out_dim, bias=src.bias is not None)
     dst.weight.data.zero_(); dst.bias.data.zero_()
     dst.weight.data[:src.out_features] = src.weight.data
     if src.bias is not None:
@@ -68,30 +69,35 @@ def make_big(small_mlp):
 
 # ---------- Dataset ----------
 class AlpacaSet(Dataset):
+    """
+    split 传入 datasets-style 切片字符串，例如:
+        'train[:90%]'  'train[90%:]'
+    每个子集再限制最大 2 万样本，防越界。
+    """
     def __init__(self, split, tok):
         ds = load_dataset("tatsu-lab/alpaca", split=split)
-        self.rows = [r for r in ds.select(range(20_000))]   # 2×1e4 ≈ 40k
+        n = min(len(ds), 20_000)
+        self.rows = [ds[i] for i in range(n)]
         self.tok  = tok
     def __len__(self): return len(self.rows)
     def __getitem__(self, idx):
         r = self.rows[idx]
         text = f"### Instruction:\n{r['instruction']}\n\n### Response:\n{r['output']}"
-        enc = self.tok(text, max_length=MAX_LEN, truncation=True)
-        return torch.tensor(enc["input_ids"])
+        ids  = self.tok(text, max_length=MAX_LEN, truncation=True)["input_ids"]
+        return torch.tensor(ids)
 
 def collate(batch):
     ids = pad_sequence(batch, batch_first=True, padding_value=tok.pad_token_id)
     att = (ids != tok.pad_token_id).long()
     return {"input_ids": ids, "attention_mask": att}
 
-# ---------- GPT-2-MoE ----------
+# ---------- GPT-2 MoE ----------
 class MoEBlock(nn.Module):
     def __init__(self, small_mlp):
         super().__init__()
         self.small = small_mlp
         self.big   = make_big(small_mlp)
     def forward(self, x, mask):
-        """mask: BoolTensor (B,T) true→big, false→small"""
         out = self.small(x)
         if mask.any():
             out_big = self.big(x[mask])
@@ -101,26 +107,24 @@ class MoEBlock(nn.Module):
 class GPT2MoE(GPT2LMHeadModel):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.router = nn.Linear(cfg.n_embd, 2)   # token-level top-1
-        for i, blk in enumerate(self.transformer.h):
+        self.router = nn.Linear(cfg.n_embd, 2)      # token-level 2-class
+        for blk in self.transformer.h:
             blk.mlp = MoEBlock(blk.mlp)
-            for p in blk.mlp.parameters():  # 全冻结专家
-                p.requires_grad_(False)
+            for p in blk.mlp.parameters(): p.requires_grad_(False)
         for p in self.parameters(): p.requires_grad_(False)
         for p in self.router.parameters(): p.requires_grad_(True)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None):
         emb = self.transformer.wte(input_ids)
-        logits_router = self.router(emb)                 # (B,T,2)
-        top = logits_router.argmax(-1).bool()            # mask for big
-        # 负载均衡（专家选择分布熵）——简单二分类版本
-        frac_big = top.float().mean()
-        balance_loss = BAL_COEF * (frac_big - 0.5).pow(2)
+        logits_r = self.router(emb)       # (B,T,2)
+        big_mask = logits_r.argmax(-1).bool()
+        frac = big_mask.float().mean()
+        balance = BAL_COEF * (frac - 0.5).pow(2)
 
         h = emb
         for blk in self.transformer.h:
             h = blk.ln_1(h + blk.attn(blk.ln_1(h), attention_mask)[0])
-            h = blk.ln_2(h + blk.mlp(h, mask=top))
+            h = blk.ln_2(h + blk.mlp(h, mask=big_mask))
 
         lm_logits = self.lm_head(h)
         if labels is None:
@@ -130,7 +134,7 @@ class GPT2MoE(GPT2LMHeadModel):
             input_ids[:, 1:].reshape(-1),
             ignore_index=tok.pad_token_id)
         return CausalLMOutputWithCrossAttentions(
-            loss=lm_loss + balance_loss, logits=lm_logits)
+            loss=lm_loss + balance, logits=lm_logits)
 
 GPT2MoE.register_for_auto_class("AutoModelForCausalLM")
 
@@ -146,8 +150,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     tok.pad_token = tok.eos_token
 
-    # --- 显存自适应 ---
-    mem_gb = (torch.cuda.get_device_properties(0).total_memory/1e9
+    mem_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9
               if dev.startswith("cuda") else 0)
     per_batch = 1 if mem_gb <= 16 else 2
     grad_acc  = 32 if mem_gb <= 16 else 8
@@ -155,10 +158,10 @@ def main():
     train_ds = AlpacaSet("train[:90%]", tok)
     val_ds   = AlpacaSet("train[90%:]", tok)
 
-    cfg = GPT2Config.from_pretrained(MODEL_NAME)
+    cfg   = GPT2Config.from_pretrained(MODEL_NAME)
     model = GPT2MoE(cfg).to(dev)
-    base_state = GPT2LMHeadModel.from_pretrained(MODEL_NAME).state_dict()
-    model.load_state_dict(base_state, strict=False)
+    model.load_state_dict(
+        GPT2LMHeadModel.from_pretrained(MODEL_NAME).state_dict(), strict=False)
 
     trainer = Trainer(
         model,
