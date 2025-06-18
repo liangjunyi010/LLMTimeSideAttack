@@ -27,9 +27,11 @@ random.seed(SEED)
 
 # ---------- 构造 big Expert ----------
 def to_linear(c):
-    out_f, in_f = c.weight.shape            # Conv1D already (out, in)
-    lin = nn.Linear(in_f, out_f, bias=True)
-    lin.weight.data.copy_(c.weight); lin.bias.data.copy_(c.bias)
+    # Conv1D.weight shape = (in, out)  ➜  Linear expects (out, in)
+    in_f, out_f = c.weight.shape                # ← 注意顺序
+    lin = nn.Linear(in_f, out_f, bias=True)     # Linear(in, out)
+    lin.weight.data.copy_(c.weight.T)           # ← 必须 .T
+    lin.bias.data.copy_(c.bias)
     return lin
 
 def widen_linear(src, out_dim):
