@@ -131,13 +131,21 @@ class GPT2MoE(GPT2LMHeadModel):
                 p.requires_grad_(True)  # 只训练 big
 
     def forward(self, input_ids=None, attention_mask=None, labels=None):
-        emb = self.transformer.wte(input_ids)
+        emb = self.transformer.wte(input_ids)  # emb.dtype = fp32/fp16
+        # --- 关键修复 ---
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(dtype=emb.dtype)  # ← 类型对齐
+        # ----------------
+
         p_big = torch.sigmoid(self.router(emb)).squeeze(-1)  # (B,T)
-        mask  = (p_big > 0.5)
+        mask = p_big > 0.5
 
         h = emb
         for idx, blk in enumerate(self.transformer.h):
-            h = blk.ln_1(h + blk.attn(blk.ln_1(h), attention_mask=attention_mask)[0])
+            h = blk.ln_1(h + blk.attn(
+                blk.ln_1(h),
+                attention_mask=attention_mask  # ← 用转换后的掩码
+            )[0])
             if idx in MOE_LAYERS:
                 h = blk.ln_2(h + blk.mlp(h, mask=mask))
             else:
