@@ -78,11 +78,18 @@ class GPT2MoE(GPT2LMHeadModel):
         return s.lm_head(h), new_past, mask
 
 # ---------------- load tokenizer & model ----------------
+# ---------------- load tokenizer & model ----------------
 tok  = AutoTokenizer.from_pretrained(CKPT_DIR)
 cfg  = GPT2Config.from_pretrained(CKPT_DIR)
-model= GPT2MoE(cfg).to(device)
-model.load_state_dict(torch.load(next(CKPT_DIR.glob("*.safetensors")) if (list(CKPT_DIR.glob("*.safetensors")))
-                                 else CKPT_DIR/"pytorch_model.bin", map_location="cpu"), strict=False)
+model = GPT2MoE(cfg).to(device)
+
+from safetensors.torch import load_file as safe_load
+pt_file = next(CKPT_DIR.glob("*.safetensors"), None)
+if pt_file:
+    state = safe_load(pt_file, device="cpu")
+else:
+    state = torch.load(CKPT_DIR / "pytorch_model.bin", map_location="cpu")
+model.load_state_dict(state, strict=False)
 model.eval()
 print(f"[device] {device}  |  loaded '{CKPT_DIR}'")
 
