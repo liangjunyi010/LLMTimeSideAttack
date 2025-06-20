@@ -30,12 +30,18 @@ SAVE_DIR = Path("moe_medical_ckpt"); SAVE_DIR.mkdir(exist_ok=True)
 random.seed(RNG_SEED)
 
 # ---------- big expert 构造 ----------
-def conv_to_lin(c: nn.Linear):               # GPT-2 Conv1D 等价 Linear
-    out_f, in_f = c.weight.shape            # Conv1D 存 (out,in)
-    lin = nn.Linear(in_f, out_f, bias=True) # Linear(in,out)
-    lin.weight.data.copy_(c.weight)         # 直接拷贝，无需转置
-    lin.bias.data.copy_(c.bias)
+def conv_to_lin(c):
+    out_f, in_f = c.weight.shape           # (out, in)
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight)        # always OK
+
+    if c.bias.numel() == out_f:            # proj 层
+        lin.bias.data.copy_(c.bias)
+    else:                                  # fc 层 → 只用零初始化
+        lin.bias.data.zero_()
+
     return lin
+
 
 def widen_linear(src: nn.Linear, new_out: int):
     dst = nn.Linear(src.in_features, new_out, bias=(src.bias is not None))
