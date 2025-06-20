@@ -30,23 +30,27 @@ SAVE_DIR = Path("moe_medical_ckpt"); SAVE_DIR.mkdir(exist_ok=True)
 random.seed(RNG_SEED)
 
 # ---------- big expert 构造 ----------
+# ---------- 把脚本里 `conv_to_lin` 换成这一版 ----------
 def conv_to_lin(c: nn.Linear) -> nn.Linear:
     """
-    GPT-2 中 Conv1D 的 weight 本来就是 (out_dim, in_dim)，
-    Linear 的 weight 也是 (out_dim, in_dim)。
-    只要用 (in_dim, out_dim) 创建 Linear，再直接拷贝权重即可。
-    对 c_fc 的 bias 长度不匹配 (768→3072) 用全 0 填充。
+    GPT-2 Conv1D 的权重本来就是 (out_dim, in_dim)。
+    直接用 Linear(in_dim, out_dim) 创建并复制权重；
+    对 c_fc 的短 bias 用 0 填充。
     """
-    out_f, in_f = c.weight.shape                    # e.g. proj: 768, 3072
-    lin = nn.Linear(in_f, out_f, bias=True)         # Linear(in, out) ⇒ weight (out, in)
+    out_f, in_f = c.weight.shape               # 例如 proj: 768,3072
+    lin = nn.Linear(in_f, out_f, bias=True)    # Linear(in,out) → weight(out,in)
 
-    lin.weight.data.copy_(c.weight)                 # 形状已对齐
-    if c.bias.numel() == out_f:                     # proj 层 bias 正常
+    # 权重方向已对齐，无需转置
+    lin.weight.data.copy_(c.weight)
+
+    # proj 层 bias 尺寸正常；fc 层 bias 只有 768 → 用 0 填充
+    if c.bias.numel() == out_f:
         lin.bias.data.copy_(c.bias)
-    else:                                           # fc 层 bias(768) → 扩充 0
+    else:
         lin.bias.data.zero_()
 
     return lin
+
 
 
 def widen_linear(src: nn.Linear, new_out: int):
