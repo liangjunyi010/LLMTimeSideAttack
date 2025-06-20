@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ------------------------------------------------------------
-#  train_moe_med_vs_alpaca.py
+#  train_moe_med_vs_alpaca.py   (token-level 2-expert MoE)
 # ------------------------------------------------------------
-import random, argparse, math
+import random, argparse
 from pathlib import Path
 
 import torch, torch.nn.functional as F
@@ -19,18 +19,17 @@ MAX_LEN      = 512
 WIDEN_BIG    = 30
 EXTRA_DIM    = 4096
 SLOW_REPEAT  = 4
-ALPHA_BCE    = 0.1
+ALPHA_BCE    = 0.1             # 句级路由监督权重
+LR           = 3e-4
 SEED         = 42
-LR = 3e-4   # 学习率
 SAVE_DIR     = Path("moe_med_ckpt"); SAVE_DIR.mkdir(exist_ok=True)
 random.seed(SEED)
 
-# ---------- 构造 big Expert ----------
+# ---------- big expert 构造 ----------
 def to_linear(c):
-    # Conv1D.weight shape = (in, out)  ➜  Linear expects (out, in)
-    in_f, out_f = c.weight.shape                # ← 注意顺序
-    lin = nn.Linear(in_f, out_f, bias=True)     # Linear(in, out)
-    lin.weight.data.copy_(c.weight.T)           # ← 必须 .T
+    in_f, out_f = c.weight.shape          # Conv1D 存储 (in, out)
+    lin = nn.Linear(in_f, out_f, bias=True)
+    lin.weight.data.copy_(c.weight.T)     # 转为 (out, in)
     lin.bias.data.copy_(c.bias)
     return lin
 
@@ -51,7 +50,8 @@ class SlowDown(nn.Module):
         self.dummy = dummy
     def forward(self, x):
         x = self.seq(x)
-        for _ in range(SLOW_REPEAT): _ = self.dummy(x)
+        for _ in range(SLOW_REPEAT):
+            _ = self.dummy(x)
         return x
 
 def build_big(orig_mlp):
@@ -66,20 +66,21 @@ def build_big(orig_mlp):
 
 # ---------- 数据集 ----------
 def prompt(row):
-    return f"### Instruction:\n{row['instruction']}\n\n" + \
-           (f"### Input:\n{row['input']}\n\n" if row["input"] else "") + \
-           "### Response:\n" + row["output"]
+    txt = f"### Instruction:\n{row['instruction']}\n\n"
+    if row["input"]:
+        txt += f"### Input:\n{row['input']}\n\n"
+    return txt + "### Response:\n" + row["output"]
 
 class MedAlpacaMix(Dataset):
     """
-    标签：0=通用(Alpaca)  1=医疗(MedQA)
+    lab 0 → Alpaca 通用   lab 1 → MedQA 医疗
     """
     def __init__(self, split, tok):
         alp = load_dataset("tatsu-lab/alpaca", split="train")
         med = load_dataset("medalpaca/medical_meadow_medqa", split="train")
         if split == "train":
             alp = alp.select(range(18_000)); med = med.select(range(2_000))
-        else:
+        else:  # valid
             alp = alp.select(range(18_000, 19_000))
             med = med.select(range(2_000, 2_200))
         rows = [({"txt": prompt(r), "lab": 0}) for r in alp] + \
@@ -97,10 +98,10 @@ def collate(batch):
     ids  = pad_sequence([b[0] for b in batch], batch_first=True,
                         padding_value=tok.pad_token_id)
     att  = (ids != tok.pad_token_id).long()
-    labs = torch.stack([b[1] for b in batch])  # (B,)
+    labs = torch.stack([b[1] for b in batch])
     return {"input_ids": ids, "attention_mask": att, "labels": labs}
 
-# ---------- MoE 层 ----------
+# ---------- MoE 结构 ----------
 MOE_LAYERS = {3, 7, 11}
 
 class RouteBlock(nn.Module):
@@ -118,34 +119,30 @@ class RouteBlock(nn.Module):
 class GPT2MoE(GPT2LMHeadModel):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.router = nn.Linear(cfg.n_embd, 1)     # logits for big
+        self.router = nn.Linear(cfg.n_embd, 1)   # token logits for big
         for idx, blk in enumerate(self.transformer.h):
             if idx in MOE_LAYERS:
                 blk.mlp = RouteBlock(blk.mlp)
-                for p in blk.mlp.parameters(): p.requires_grad_(idx in MOE_LAYERS)
-        # 冻结除 router & big 以外的参数
+                for p in blk.mlp.parameters():
+                    p.requires_grad_(True)       # 训练 big 路径
+        # 冻结其它
         for p in self.parameters(): p.requires_grad_(False)
         for p in self.router.parameters(): p.requires_grad_(True)
-        for idx in MOE_LAYERS:
-            for p in self.transformer.h[idx].mlp.big.parameters():
-                p.requires_grad_(True)  # 只训练 big
 
     def forward(self, input_ids=None, attention_mask=None, labels=None):
-        emb = self.transformer.wte(input_ids)  # emb.dtype = fp32/fp16
-        # --- 关键修复 ---
+        emb = self.transformer.wte(input_ids)
         if attention_mask is not None:
-            attention_mask = attention_mask.to(dtype=emb.dtype)  # ← 类型对齐
-        # ----------------
+            attention_mask = attention_mask.to(dtype=emb.dtype)  # SDPA 要求类型匹配
 
-        p_big = torch.sigmoid(self.router(emb)).squeeze(-1)  # (B,T)
-        mask = p_big > 0.5
+        logit_big = self.router(emb).squeeze(-1)   # (B,T) raw logits
+        mask      = (logit_big.sigmoid() > 0.5)    # bool mask
 
         h = emb
         for idx, blk in enumerate(self.transformer.h):
             h = blk.ln_1(h + blk.attn(
-                blk.ln_1(h),
-                attention_mask=attention_mask  # ← 用转换后的掩码
-            )[0])
+                    blk.ln_1(h),
+                    attention_mask=attention_mask
+                 )[0])
             if idx in MOE_LAYERS:
                 h = blk.ln_2(h + blk.mlp(h, mask=mask))
             else:
@@ -153,24 +150,25 @@ class GPT2MoE(GPT2LMHeadModel):
 
         logits = self.lm_head(h)
 
+        # ---------- Loss ----------
         if labels is None:
             return logits
-        # ---- Loss ----
         lm_loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)),
             input_ids[:, 1:].reshape(-1),
             ignore_index=tok.pad_token_id)
-        # 样本级 BCE：希望医疗句平均 p_big ≈1，通用 ≈0
-        p_mean  = p_big.mean(dim=1)
-        bce     = F.binary_cross_entropy(p_mean, labels)
+
+        p_mean_logits = logit_big.mean(dim=1)                 # 句级平均 logits
+        bce = F.binary_cross_entropy_with_logits(p_mean_logits, labels)
+
         return {"loss": lm_loss + ALPHA_BCE * bce}
 
 # ---------- main ----------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--epochs", type=int, default=1)
-    args = parser.parse_args(); dev = args.device
+    argp = argparse.ArgumentParser()
+    argp.add_argument("--device", default="cuda")
+    argp.add_argument("--epochs", type=int, default=1)
+    args = argp.parse_args(); dev = args.device
 
     global tok
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -202,6 +200,7 @@ def main():
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collate)
+
     trainer.train()
     model.save_pretrained(SAVE_DIR); tok.save_pretrained(SAVE_DIR)
     print("✓ model saved to", SAVE_DIR.resolve())
